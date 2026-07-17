@@ -1,0 +1,78 @@
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --surface: #f9f8f6;
+  --white: #ffffff;
+  --ground: #f1efea;
+  --rule: #e3dfd7;
+  --rule-hi: #c9c4b9;
+  --ink: #141210;
+  --ink-2: #3e3c38;
+  --ink-3: #8d8a81;
+  --ink-4: #bbb8b1;
+  --signal: #1a56db;
+  --signal-light: #eff4ff;
+  --success: #166534;
+  --success-light: #f0fdf4;
+  --warning: #92400e;
+  --warning-light: #fffbeb;
+  --danger: #991b1b;
+  --danger-light: #fef2f2;
+  --font-body: "Inter", sans-serif;
+  --font-mono: "DM Mono", monospace;
+}
+
+body {
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-body);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes skeletonPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes progressPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
