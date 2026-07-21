@@ -1,7 +1,7 @@
 export function TranscriptView({ segments }) {
   if (!segments || segments.length === 0) {
     return (
-      <p className="font-body font-light text-ink-3 text-sm py-4">
+      <p className="font-body font-light text-ink-4 text-[13px] text-center py-4">
         Transcript is not available.
       </p>
     );
@@ -18,18 +18,21 @@ export function TranscriptView({ segments }) {
   }, []);
 
   return (
-    <div className="flex flex-col gap-4 max-h-[600px] overflow-y-auto pr-2">
+    <div
+      className="flex flex-col overflow-y-auto pr-1"
+      style={{ gap: "16px", maxHeight: "480px" }}
+    >
       {grouped.map((group, i) => (
         <div key={i} className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
-            <span className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4">
+            <span className="font-mono text-[9px] tracking-widest uppercase text-ink-4">
               {group.speaker}
             </span>
             <span className="font-mono text-[9px] text-ink-4">
               {formatTime(group.start)}
             </span>
           </div>
-          <p className="font-body font-light text-ink text-sm leading-relaxed">
+          <p className="font-body font-light text-[13px] text-ink-2 leading-[1.6]">
             {group.texts.join(" ")}
           </p>
         </div>
