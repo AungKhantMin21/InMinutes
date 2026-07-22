@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -16,12 +16,49 @@ const PROCESSING_MESSAGES = {
   pending: "Queued for processing...",
 };
 
-function SkeletonLine({ width = "w-full" }) {
+function Skeleton({ width = "w-full", height = "h-3" }) {
   return (
     <div
-      className={`bg-ground h-4 ${width} rounded`}
+      className={`bg-ground ${height} ${width} rounded`}
       style={{ animation: "skeletonPulse 1.5s ease infinite" }}
     />
+  );
+}
+
+function OutputSkeleton() {
+  return (
+    <div className="flex flex-col gap-0">
+      <div className="border-b border-rule pb-2 flex gap-1">
+        <Skeleton width="w-14" height="h-3" />
+        <div className="w-4" />
+        <Skeleton width="w-20" height="h-3" />
+        <div className="w-4" />
+        <Skeleton width="w-16" height="h-3" />
+        <div className="w-4" />
+        <Skeleton width="w-16" height="h-3" />
+      </div>
+      <div className="flex flex-col gap-3 pt-5">
+        <Skeleton width="w-36" height="h-4" />
+        <div className="flex flex-col gap-2">
+          <Skeleton width="w-full" />
+          <Skeleton width="w-5/6" />
+          <Skeleton width="w-4/5" />
+        </div>
+        <Skeleton width="w-28" height="h-4" />
+        <div className="flex flex-col gap-2">
+          <Skeleton width="w-full" />
+          <Skeleton width="w-3/4" />
+          <Skeleton width="w-5/6" />
+          <Skeleton width="w-2/3" />
+        </div>
+        <Skeleton width="w-32" height="h-4" />
+        <div className="flex flex-col gap-2">
+          <Skeleton width="w-full" />
+          <Skeleton width="w-4/5" />
+          <Skeleton width="w-3/4" />
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -59,7 +96,26 @@ export function Meeting() {
   const [output, setOutput] = useState(null);
   const [loading, setLoading] = useState(true);
   const [outputLoading, setOutputLoading] = useState(false);
+  const [outputError, setOutputError] = useState("");
   const [error, setError] = useState("");
+  const isInitialLoad = useRef(true);
+
+  async function fetchOutput() {
+    setOutputLoading(true);
+    setOutputError("");
+    try {
+      const [t, o] = await Promise.all([
+        getMeetingTranscript(id),
+        getMeetingOutput(id),
+      ]);
+      setTranscript(t);
+      setOutput(o);
+    } catch (err) {
+      setOutputError("Output could not be loaded. Try again.");
+    } finally {
+      setOutputLoading(false);
+    }
+  }
 
   useEffect(() => {
     let intervalId;
@@ -69,23 +125,21 @@ export function Meeting() {
         const data = await getMeeting(id);
         setMeeting(data);
 
-        if (data.status === "done") {
-          setOutputLoading(true);
-          const [t, o] = await Promise.all([
-            getMeetingTranscript(id),
-            getMeetingOutput(id),
-          ]);
-          setTranscript(t);
-          setOutput(o);
-          setOutputLoading(false);
+        if (data.status === "done" && !output) {
+          await fetchOutput();
         }
 
         return data.status;
       } catch (err) {
-        setError("Meeting not found.");
+        if (isInitialLoad.current) {
+          setError("Meeting not found.");
+        }
         return "failed";
       } finally {
-        setLoading(false);
+        if (isInitialLoad.current) {
+          setLoading(false);
+          isInitialLoad.current = false;
+        }
       }
     }
 
@@ -106,10 +160,10 @@ export function Meeting() {
   if (loading) {
     return (
       <div className="max-w-[720px] mx-auto px-6 py-10 flex flex-col gap-6">
-        <SkeletonLine width="w-16" />
+        <Skeleton width="w-16" height="h-3" />
         <div className="flex flex-col gap-3">
-          <SkeletonLine width="w-64" />
-          <SkeletonLine width="w-32" />
+          <Skeleton width="w-64" height="h-5" />
+          <Skeleton width="w-32" height="h-3" />
         </div>
       </div>
     );
@@ -174,16 +228,19 @@ export function Meeting() {
 
       {meeting.status === "done" && (
         outputLoading ? (
-          <div className="flex flex-col gap-3">
-            <SkeletonLine />
-            <SkeletonLine width="w-3/4" />
-            <SkeletonLine width="w-1/2" />
+          <OutputSkeleton />
+        ) : outputError ? (
+          <div className="flex flex-col gap-2 py-4">
+            <p className="font-body text-[13px] text-danger">{outputError}</p>
+            <button
+              onClick={fetchOutput}
+              className="font-body text-[13px] text-signal underline underline-offset-4 text-left w-fit"
+            >
+              Try again
+            </button>
           </div>
         ) : (
-          <Tabs
-            defaultValue="minutes"
-            className="flex-col gap-0"
-          >
+          <Tabs defaultValue="minutes" className="flex-col gap-0">
             <div className="border-b border-rule">
               <TabsList
                 variant="line"
@@ -206,38 +263,19 @@ export function Meeting() {
               </TabsList>
             </div>
 
-            <TabsContent
-              value="minutes"
-              className="mt-0 pt-5"
-              style={{ animation: "fadeIn 200ms ease" }}
-            >
-              <MinutesView
-                minutes={output?.meetingMinutes ?? ""}
-                title={meeting.title}
-              />
+            <TabsContent value="minutes" className="mt-0 pt-5" style={{ animation: "fadeIn 200ms ease" }}>
+              <MinutesView minutes={output?.meetingMinutes ?? ""} title={meeting.title} />
             </TabsContent>
 
-            <TabsContent
-              value="action-items"
-              className="mt-0 pt-5"
-              style={{ animation: "fadeIn 200ms ease" }}
-            >
+            <TabsContent value="action-items" className="mt-0 pt-5" style={{ animation: "fadeIn 200ms ease" }}>
               <ActionItemsTable actionItems={output?.actionItems ?? []} />
             </TabsContent>
 
-            <TabsContent
-              value="key-points"
-              className="mt-0 pt-5"
-              style={{ animation: "fadeIn 200ms ease" }}
-            >
+            <TabsContent value="key-points" className="mt-0 pt-5" style={{ animation: "fadeIn 200ms ease" }}>
               <KeyPointsList keyPoints={output?.keyPoints ?? []} />
             </TabsContent>
 
-            <TabsContent
-              value="transcript"
-              className="mt-0 pt-5"
-              style={{ animation: "fadeIn 200ms ease" }}
-            >
+            <TabsContent value="transcript" className="mt-0 pt-5" style={{ animation: "fadeIn 200ms ease" }}>
               <TranscriptView segments={transcript?.diarizedSegments ?? []} />
             </TabsContent>
           </Tabs>
