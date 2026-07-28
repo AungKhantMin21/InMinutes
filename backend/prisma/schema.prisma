@@ -7,6 +7,39 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+model Employee {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         String    @default("member")
+  jobTitle     String?
+  createdAt    DateTime  @default(now())
+
+  person       Person?   @relation(fields: [personId], references: [id])
+  personId     String?   @unique
+
+  meetings     Meeting[]
+}
+
+// ─── Person Registry ─────────────────────────────────────────────────────────
+
+model Person {
+  id            String   @id @default(cuid())
+  canonicalName String
+  aliases       String[]
+  email         String?
+  jobTitle      String?
+  createdAt     DateTime @default(now())
+
+  employee      Employee?
+  participants  MeetingParticipant[]
+}
+
+// ─── Meetings ────────────────────────────────────────────────────────────────
+
 model Meeting {
   id          String    @id @default(cuid())
   title       String
@@ -17,8 +50,12 @@ model Meeting {
   createdAt   DateTime  @default(now())
   completedAt DateTime?
 
-  transcript  Transcript?
-  output      Output?
+  uploadedBy   Employee? @relation(fields: [employeeId], references: [id])
+  employeeId   String?
+
+  transcript   Transcript?
+  output       Output?
+  participants MeetingParticipant[]
 }
 
 model Transcript {
@@ -38,4 +75,18 @@ model Output {
   actionItems    Json
   meetingMinutes String
   createdAt      DateTime @default(now())
+}
+
+// ─── Participant linking ──────────────────────────────────────────────────────
+
+model MeetingParticipant {
+  id           String   @id @default(cuid())
+  meetingId    String
+  meeting      Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  personId     String
+  person       Person   @relation(fields: [personId], references: [id])
+  speakerLabel String
+  createdAt    DateTime @default(now())
+
+  @@unique([meetingId, speakerLabel])
 }

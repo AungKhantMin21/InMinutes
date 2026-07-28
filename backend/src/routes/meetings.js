@@ -3,9 +3,11 @@ import { prisma } from "../lib/db.js";
 
 const router = Router();
 
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
   try {
+    const where = req.employee.role === "admin" ? {} : { employeeId: req.employee.employeeId };
     const meetings = await prisma.meeting.findMany({
+      where,
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
@@ -78,6 +80,98 @@ router.get("/:id/output", async (req, res) => {
     res.json({ data: output });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch output" });
+  }
+});
+
+router.post("/:id/review/confirm", async (req, res) => {
+  const { speakerMap, meetingMinutes, actionItems } = req.body;
+
+  try {
+    const transcript = await prisma.transcript.findUnique({
+      where: { meetingId: req.params.id },
+      select: { diarizedSegments: true },
+    });
+
+    if (!transcript) {
+      return res.status(404).json({ error: "Transcript not found" });
+    }
+
+    const mappedSegments = transcript.diarizedSegments.map((seg) => ({
+      ...seg,
+      speaker: speakerMap[seg.speaker] || seg.speaker,
+    }));
+
+    const mappedMinutes = Object.entries(speakerMap).reduce(
+      (text, [original, replacement]) =>
+        replacement ? text.replaceAll(original, replacement) : text,
+      meetingMinutes
+    );
+
+    const mappedActionItems = actionItems.map((item) => ({
+      ...item,
+      owner: speakerMap[item.owner] || item.owner,
+    }));
+
+    await prisma.transcript.update({
+      where: { meetingId: req.params.id },
+      data: { diarizedSegments: mappedSegments },
+    });
+
+    await prisma.output.update({
+      where: { meetingId: req.params.id },
+      data: { meetingMinutes: mappedMinutes, actionItems: mappedActionItems },
+    });
+
+    await prisma.meeting.update({
+      where: { id: req.params.id },
+      data: { status: "done", completedAt: new Date() },
+    });
+
+    for (const [speakerLabel, realName] of Object.entries(speakerMap)) {
+      if (!realName) continue;
+
+      let person = await prisma.person.findFirst({
+        where: {
+          OR: [
+            { canonicalName: { equals: realName, mode: "insensitive" } },
+            { aliases: { has: realName } },
+          ],
+        },
+      });
+
+      if (!person) {
+        person = await prisma.person.create({
+          data: { canonicalName: realName, aliases: [realName] },
+        });
+      } else if (!person.aliases.includes(realName)) {
+        await prisma.person.update({
+          where: { id: person.id },
+          data: { aliases: { push: realName } },
+        });
+      }
+
+      await prisma.meetingParticipant.upsert({
+        where: { meetingId_speakerLabel: { meetingId: req.params.id, speakerLabel } },
+        create: { meetingId: req.params.id, personId: person.id, speakerLabel },
+        update: { personId: person.id },
+      });
+    }
+
+    res.json({ data: { status: "done" } });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to confirm review" });
+  }
+});
+
+router.post("/:id/review/discard", async (req, res) => {
+  try {
+    await prisma.meeting.update({
+      where: { id: req.params.id },
+      data: { status: "discarded" },
+    });
+    res.json({ data: { status: "discarded" } });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to discard meeting" });
   }
 });
 

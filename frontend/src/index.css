@@ -27,6 +27,10 @@
   --font-mono: "DM Mono", monospace;
 }
 
+html {
+  font-family: var(--font-body);
+}
+
 body {
   background: var(--surface);
   color: var(--ink);

@@ -4,6 +4,31 @@ const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL,
 });
 
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem("token");
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+export async function register({ name, email, password, jobTitle }) {
+  const res = await api.post("/api/auth/register", { name, email, password, jobTitle });
+  return res.data.data;
+}
+
+export async function login({ email, password }) {
+  const res = await api.post("/api/auth/login", { email, password });
+  return res.data.data;
+}
+
+export async function getMe() {
+  const res = await api.get("/api/auth/me");
+  return res.data.data;
+}
+
+// ─── Meetings ────────────────────────────────────────────────────────────────
+
 export async function presignUpload({ filename, contentType, title }) {
   const res = await api.post("/api/upload/presign", { filename, contentType, title });
   return res.data.data;
@@ -31,5 +56,19 @@ export async function getMeetingTranscript(id) {
 
 export async function getMeetingOutput(id) {
   const res = await api.get(`/api/meetings/${id}/output`);
+  return res.data.data;
+}
+
+export async function confirmReview(id, { speakerMap, meetingMinutes, actionItems }) {
+  const res = await api.post(`/api/meetings/${id}/review/confirm`, {
+    speakerMap,
+    meetingMinutes,
+    actionItems,
+  });
+  return res.data.data;
+}
+
+export async function discardReview(id) {
+  const res = await api.post(`/api/meetings/${id}/review/discard`);
   return res.data.data;
 }

@@ -7,7 +7,7 @@ import { ActionItemsTable } from "@/components/ActionItemsTable";
 import { TranscriptView } from "@/components/TranscriptView";
 import { getMeeting, getMeetingTranscript, getMeetingOutput } from "@/lib/api";
 
-const TERMINAL = ["done", "failed"];
+const TERMINAL = ["done", "failed", "discarded"];
 
 const PROCESSING_MESSAGES = {
   uploading: "Uploading recording...",
@@ -125,6 +125,11 @@ export function Meeting() {
         const data = await getMeeting(id);
         setMeeting(data);
 
+        if (data.status === "reviewing") {
+          navigate(`/meetings/${id}/review`);
+          return data.status;
+        }
+
         if (data.status === "done" && !output) {
           await fetchOutput();
         }
@@ -187,7 +192,7 @@ export function Meeting() {
     <div className="max-w-[720px] mx-auto px-6 py-10 flex flex-col gap-5">
       <button
         onClick={() => navigate("/")}
-        className="font-mono text-[12px] text-ink-4 hover:text-ink-3 transition-colors text-left w-fit"
+        className="font-mono text-[12px] text-ink-4 hover:text-ink-3 transition-colors duration-150 text-left w-fit"
       >
         ← Back
       </button>
@@ -226,6 +231,20 @@ export function Meeting() {
         </div>
       )}
 
+      {meeting.status === "discarded" && (
+        <div className="flex flex-col gap-2">
+          <p className="font-body text-[13px] text-ink-2">
+            This meeting was discarded during review.
+          </p>
+          <button
+            onClick={() => navigate("/")}
+            className="font-body text-[13px] text-signal underline underline-offset-4 text-left w-fit"
+          >
+            Upload a new recording →
+          </button>
+        </div>
+      )}
+
       {meeting.status === "done" && (
         outputLoading ? (
           <OutputSkeleton />
@@ -255,7 +274,7 @@ export function Meeting() {
                   <TabsTrigger
                     key={tab.value}
                     value={tab.value}
-                    className="font-body font-medium text-[13px] text-ink-3 data-active:text-ink rounded-none px-4 py-2.5 h-auto border-0 bg-transparent hover:text-ink-2 transition-colors after:bottom-[-1px]"
+                    className="font-body font-medium text-[13px] text-ink-3 data-[active]:text-ink rounded-none px-4 py-2.5 h-auto border-b-2 border-transparent data-[active]:border-ink -mb-px bg-transparent hover:text-ink-2 transition-colors duration-150"
                   >
                     {tab.label}
                   </TabsTrigger>

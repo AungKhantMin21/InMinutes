@@ -19,6 +19,11 @@ const STATUS_CONFIG = {
     className: "font-mono bg-signal-light text-signal border-signal/20",
     style: { animation: "progressPulse 2s ease infinite" },
   },
+  reviewing: {
+    label: "Awaiting Review",
+    className: "font-mono bg-warning-light text-warning border-warning/20",
+    style: { animation: "progressPulse 2s ease infinite" },
+  },
   done: {
     label: "Done",
     className: "font-mono bg-success-light text-success border-success/20",
@@ -26,6 +31,10 @@ const STATUS_CONFIG = {
   failed: {
     label: "Failed",
     className: "font-mono bg-danger-light text-danger border-danger/20",
+  },
+  discarded: {
+    label: "Discarded",
+    className: "font-mono bg-ground text-ink-4 border-rule",
   },
 };
 

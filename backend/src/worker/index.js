@@ -50,10 +50,10 @@ async function processJob(job) {
 
   await prisma.meeting.update({
     where: { id: meetingId },
-    data: { status: "done", completedAt: new Date() },
+    data: { status: "reviewing" },
   });
 
-  console.log(`Done — meetingId: ${meetingId}`);
+  console.log(`Awaiting review — meetingId: ${meetingId}`);
 }
 
 const worker = new Worker("meeting-processing", processJob, { connection: redis });

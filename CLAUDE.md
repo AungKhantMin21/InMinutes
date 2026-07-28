@@ -242,18 +242,39 @@ animation. If you are about to add a spinner, stop and use a skeleton instead.
 
 ---
 
+## Routing Behaviour
+
+```
+Upload complete → /meetings/:id (polling)
+        ↓
+Status hits "reviewing" → redirect to /meetings/:id/review
+        ↓
+User confirms → redirect to /meetings/:id (read-only, done)
+User discards → redirect to / (home)
+```
+
+Meeting.jsx polls until "reviewing", "done", "failed", or "discarded".
+On "reviewing" it redirects immediately — it does not render output.
+Review.jsx is never polled — it is a static edit form.
+Meeting.jsx in "done" state is fully read-only — no editing.
+
+---
+
 ## File-by-File Responsibilities
 
-| File                              | Owns                                 |
-| --------------------------------- | ------------------------------------ |
-| `frontend/src/lib/api.js`         | All HTTP calls to backend            |
-| `backend/src/lib/intelligence.js` | All Gemini API calls                 |
-| `backend/src/lib/assemblyai.js`   | All AssemblyAI calls                 |
-| `backend/src/lib/r2.js`           | All Cloudflare R2 operations         |
-| `backend/src/lib/queue.js`        | BullMQ queue + Redis connection      |
-| `backend/src/lib/db.js`           | Prisma client singleton              |
-| `backend/src/worker/index.js`     | Full processing pipeline             |
-| `backend/prisma/schema.prisma`    | Single source of truth for DB schema |
+| File                                        | Owns                                       |
+| ------------------------------------------- | ------------------------------------------ |
+| `frontend/src/lib/api.js`                   | All HTTP calls to backend                  |
+| `frontend/src/pages/Review.jsx`             | HITL review + edit + confirm/discard       |
+| `frontend/src/pages/Meeting.jsx`            | Read-only output display (done state only) |
+| `frontend/src/components/SpeakerMapper.jsx` | Speaker rename inputs                      |
+| `backend/src/lib/intelligence.js`           | All Gemini API calls                       |
+| `backend/src/lib/assemblyai.js`             | All AssemblyAI calls                       |
+| `backend/src/lib/r2.js`                     | All Cloudflare R2 operations               |
+| `backend/src/lib/queue.js`                  | BullMQ queue + Redis connection            |
+| `backend/src/lib/db.js`                     | Prisma client singleton                    |
+| `backend/src/worker/index.js`               | Full processing pipeline                   |
+| `backend/prisma/schema.prisma`              | Single source of truth for DB schema       |
 
 Never put logic that belongs in one of these files anywhere else.
 
@@ -290,6 +311,9 @@ Never put logic that belongs in one of these files anywhere else.
 ✗ Leave console.log in production code paths
 ✗ Leave TODO comments in code
 ✗ Change the AI model from gemini-2.5-flash
+✗ Set meeting status directly to "done" from the worker — always "reviewing" first
+✗ Allow editing on the Meeting detail page — Review.jsx is the only edit surface
+✗ Hard-delete any meeting or output row — discarded is a soft state
 ✗ Build anything outside the active Build Order step
 ```
 

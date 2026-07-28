@@ -105,7 +105,7 @@ export function UploadZone() {
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        className={`border-2 border-dashed rounded-none p-10 text-center cursor-pointer transition-colors ${
+        className={`border-2 border-dashed rounded-none p-10 text-center cursor-pointer transition-colors duration-150 ${
           isDragging ? "border-signal bg-signal-light" : "border-rule hover:border-rule-hi"
         } ${uploading ? "pointer-events-none opacity-60" : ""}`}
       >

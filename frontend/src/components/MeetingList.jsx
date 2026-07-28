@@ -88,7 +88,7 @@ export function MeetingList() {
         <Card
           key={meeting.id}
           onClick={() => navigate(`/meetings/${meeting.id}`)}
-          className="rounded-none border-rule bg-white cursor-pointer hover:border-rule-hi transition-colors"
+          className="rounded-none border-rule bg-white cursor-pointer hover:border-rule-hi transition-colors duration-150"
           style={{ animation: `fadeIn 200ms ease both`, animationDelay: `${i * 40}ms` }}
         >
           <CardContent className="p-4 flex items-center justify-between">

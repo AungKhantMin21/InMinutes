@@ -18,7 +18,7 @@ router.post("/presign", async (req, res) => {
     const audioKey = `meetings/${uuid()}.${ext}`;
 
     const meeting = await prisma.meeting.create({
-      data: { title, audioKey, status: "uploading" },
+      data: { title, audioKey, status: "uploading", employeeId: req.employee.employeeId },
     });
 
     const uploadUrl = await getUploadUrl(audioKey, contentType);
