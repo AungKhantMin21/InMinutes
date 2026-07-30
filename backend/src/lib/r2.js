@@ -21,10 +21,10 @@ export async function getUploadUrl(key, contentType) {
   return getSignedUrl(s3, command, { expiresIn: 900 });
 }
 
-export async function getDownloadUrl(key) {
+export async function getDownloadUrl(key, expiresIn = 3600) {
   const command = new GetObjectCommand({
     Bucket: process.env.R2_BUCKET_NAME,
     Key: key,
   });
-  return getSignedUrl(s3, command, { expiresIn: 3600 });
+  return getSignedUrl(s3, command, { expiresIn });
 }

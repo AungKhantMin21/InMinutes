@@ -59,8 +59,13 @@ export async function getMeetingOutput(id) {
   return res.data.data;
 }
 
-export async function confirmTranscript(id, { speakerMap }) {
-  const res = await api.post(`/api/meetings/${id}/review/confirm-transcript`, { speakerMap });
+export async function getAudioUrl(id) {
+  const res = await api.get(`/api/meetings/${id}/audio-url`);
+  return res.data.data;
+}
+
+export async function confirmTranscript(id, { speakerMap, diarizedSegments }) {
+  const res = await api.post(`/api/meetings/${id}/review/confirm-transcript`, { speakerMap, diarizedSegments });
   return res.data.data;
 }
 

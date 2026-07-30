@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../lib/db.js";
 import { meetingQueue } from "../lib/queue.js";
+import { getDownloadUrl } from "../lib/r2.js";
 
 const router = Router();
 
@@ -91,20 +92,44 @@ router.get("/:id/output", async (req, res) => {
   }
 });
 
-router.post("/:id/review/confirm-transcript", async (req, res) => {
-  const { speakerMap } = req.body;
-
+router.get("/:id/audio-url", async (req, res) => {
   try {
-    const transcript = await prisma.transcript.findUnique({
-      where: { meetingId: req.params.id },
-      select: { diarizedSegments: true },
+    const meeting = await prisma.meeting.findUnique({
+      where: { id: req.params.id },
+      select: { audioKey: true, audioContentType: true },
     });
 
-    if (!transcript) {
-      return res.status(404).json({ error: "Transcript not found" });
+    if (!meeting || !meeting.audioKey) {
+      return res.status(404).json({ error: "Audio not found" });
     }
 
-    const mappedSegments = transcript.diarizedSegments.map((seg) => ({
+    const url = await getDownloadUrl(meeting.audioKey, 7200);
+    const contentType = meeting.audioContentType ?? "audio/mpeg";
+
+    res.json({ data: { url, contentType } });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to generate audio URL" });
+  }
+});
+
+router.post("/:id/review/confirm-transcript", async (req, res) => {
+  const { speakerMap, diarizedSegments: editedSegments } = req.body;
+
+  try {
+    let baseSegments = editedSegments;
+
+    if (!baseSegments) {
+      const transcript = await prisma.transcript.findUnique({
+        where: { meetingId: req.params.id },
+        select: { diarizedSegments: true },
+      });
+      if (!transcript) {
+        return res.status(404).json({ error: "Transcript not found" });
+      }
+      baseSegments = transcript.diarizedSegments;
+    }
+
+    const mappedSegments = baseSegments.map((seg) => ({
       ...seg,
       speaker: (speakerMap && speakerMap[seg.speaker]) || seg.speaker,
     }));
