@@ -5,7 +5,8 @@ import { prisma } from "../lib/db.js";
 import { getDownloadUrl } from "../lib/r2.js";
 import { transcribeWithDiarization } from "../lib/assemblyai.js";
 import {
-  formatTranscript,
+  translateNonEnglishSegments,
+  buildEnglishTranscript,
   extractKeyPoints,
   extractActionItems,
   generateMinutes,
@@ -21,7 +22,9 @@ async function runTranscription(job) {
   });
 
   const audioUrl = await getDownloadUrl(audioKey);
-  const { rawText, segments } = await transcribeWithDiarization(audioUrl);
+  const { rawText, segments: rawSegments } = await transcribeWithDiarization(audioUrl);
+
+  const segments = await translateNonEnglishSegments(rawSegments);
 
   await prisma.transcript.create({
     data: { meetingId, rawText, diarizedSegments: segments },
@@ -49,14 +52,14 @@ async function runAnalysis(job) {
     select: { diarizedSegments: true },
   });
 
-  const formatted = formatTranscript(transcript.diarizedSegments);
+  const englishTranscript = buildEnglishTranscript(transcript.diarizedSegments);
 
   const [keyPoints, actionItems] = await Promise.all([
-    extractKeyPoints(formatted),
-    extractActionItems(formatted),
+    extractKeyPoints(englishTranscript),
+    extractActionItems(englishTranscript),
   ]);
 
-  const meetingMinutes = await generateMinutes(formatted, keyPoints, actionItems, title);
+  const meetingMinutes = await generateMinutes(englishTranscript, keyPoints, actionItems, title);
 
   await prisma.output.create({
     data: { meetingId, keyPoints, actionItems, meetingMinutes },

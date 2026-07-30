@@ -17,6 +17,57 @@ export function formatTranscript(segments) {
   return segments.map((s) => `${s.speaker}: ${s.text}`).join("\n");
 }
 
+export function buildEnglishTranscript(segments) {
+  return segments
+    .map((s) => `${s.speaker}: ${s.translatedText ?? s.text}`)
+    .join("\n");
+}
+
+export async function translateNonEnglishSegments(segments) {
+  const nonEnglish = segments
+    .map((s, i) => ({ index: i, segment: s }))
+    .filter(({ segment }) => segment.originalLang !== "en");
+
+  if (nonEnglish.length === 0) return segments;
+
+  const updated = segments.map((s) => ({ ...s }));
+  const BATCH_SIZE = 10;
+
+  for (let i = 0; i < nonEnglish.length; i += BATCH_SIZE) {
+    const batch = nonEnglish.slice(i, i + BATCH_SIZE);
+    const batchText = batch
+      .map(({ index, segment }) => `[${index}] ${segment.text}`)
+      .join("\n");
+
+    const prompt = `Translate the following meeting transcript segments to English.
+Each segment is on its own line in the format: [INDEX] text
+Return ONLY the translations in the same format: [INDEX] translated text
+No preamble. No explanation. Preserve speaker names if mentioned.
+
+Segments:
+${batchText}`;
+
+    try {
+      const response = await generate(prompt);
+      const lines = response.trim().split("\n");
+
+      for (const line of lines) {
+        const match = line.match(/^\[(\d+)\]\s+(.+)$/);
+        if (match) {
+          const originalIndex = parseInt(match[1], 10);
+          if (originalIndex >= 0 && originalIndex < updated.length) {
+            updated[originalIndex].translatedText = match[2].trim();
+          }
+        }
+      }
+    } catch {
+      // graceful degradation — leave translatedText as null for this batch
+    }
+  }
+
+  return updated;
+}
+
 export async function extractKeyPoints(transcript) {
   const prompt = `Extract the 5-8 most important key points from this meeting transcript.
 Return ONLY a JSON array of strings. No preamble. No markdown fences.
