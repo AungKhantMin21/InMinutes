@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Table,
@@ -8,26 +8,21 @@ import {
   TableHead,
   TableCell,
 } from "@/components/ui/table";
-import { SpeakerMapper } from "@/components/SpeakerMapper";
+import { AudioPlayer } from "@/components/AudioPlayer";
+import { TranscriptEditor } from "@/components/TranscriptEditor";
 import { AttendeeList } from "@/components/AttendeeList";
 import { useAuth } from "@/hooks/useAuth";
 import {
   getMeeting,
   getMeetingTranscript,
   getMeetingOutput,
+  getAudioUrl,
   confirmTranscript,
   confirmReview,
   discardReview,
 } from "@/lib/api";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function formatTime(ms) {
-  const total = Math.floor(ms / 1000);
-  const m = Math.floor(total / 60).toString().padStart(2, "0");
-  const s = (total % 60).toString().padStart(2, "0");
-  return `${m}:${s}`;
-}
 
 function todayString() {
   return new Date().toLocaleDateString("en-US", {
@@ -62,22 +57,24 @@ function SectionLabel({ label }) {
 function ReviewSkeleton() {
   return (
     <div className="flex flex-col gap-8">
-      <div className="flex flex-col gap-3">
-        <Skeleton width="w-48" height="h-5" />
-        <Skeleton width="w-32" height="h-3" />
-      </div>
-      <div className="flex flex-col gap-3">
-        <Skeleton width="w-36" height="h-3" />
-        <Skeleton width="w-full" height="h-8" />
-        <Skeleton width="w-full" height="h-8" />
-      </div>
-      <div className="flex flex-col gap-3">
-        <Skeleton width="w-36" height="h-3" />
-        <Skeleton width="w-full" height="h-4" />
-        <Skeleton width="w-5/6" height="h-4" />
-        <Skeleton width="w-4/5" height="h-4" />
-        <Skeleton width="w-full" height="h-4" />
-        <Skeleton width="w-3/4" height="h-4" />
+      <div className="sticky top-0 bg-white border-b border-rule h-12" />
+      <div className="max-w-[720px] mx-auto px-6 w-full flex flex-col gap-8 pt-6">
+        <div className="flex flex-col gap-3">
+          <Skeleton width="w-48" height="h-5" />
+          <Skeleton width="w-32" height="h-3" />
+        </div>
+        <div className="flex flex-col gap-4">
+          {[...Array(5)].map((_, i) => (
+            <div key={i} className="flex flex-col gap-1.5 py-3">
+              <div className="flex gap-3">
+                <Skeleton width="w-20" height="h-2.5" />
+                <Skeleton width="w-12" height="h-2.5" />
+              </div>
+              <Skeleton width="w-full" height="h-3" />
+              <Skeleton width="w-4/5" height="h-3" />
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -126,26 +123,26 @@ function EditableCell({ value, onChange, mono = false }) {
 
 // ─── Step 1 — Transcript Review ───────────────────────────────────────────────
 
-function StepTranscript({ meeting, transcript, onConfirm, onDiscard }) {
+function StepTranscript({ meeting, transcript, audioUrl, audioContentType, onConfirm, onDiscard }) {
   const [speakerMap, setSpeakerMap] = useState({});
+  const [segments, setSegments] = useState(transcript?.diarizedSegments ?? []);
+  const [audioCurrentTime, setAudioCurrentTime] = useState(null);
   const [confirming, setConfirming] = useState(false);
   const [discarding, setDiscarding] = useState(false);
   const [error, setError] = useState("");
-  const [transcriptExpanded, setTranscriptExpanded] = useState(true);
+  const playerRef = useRef(null);
 
-  const segments = transcript?.diarizedSegments ?? [];
-
-  const grouped = segments.reduce((acc, seg) => {
-    const last = acc[acc.length - 1];
-    if (last && last.speaker === seg.speaker) {
-      last.texts.push(seg.text);
-    } else {
-      acc.push({ speaker: seg.speaker, texts: [seg.text], start: seg.start });
-    }
-    return acc;
+  const handleSegmentsChange = useCallback((updated) => {
+    setSegments(updated);
   }, []);
 
-  const visibleGroups = transcriptExpanded ? grouped : grouped.slice(0, 3);
+  const handleSpeakerMapChange = useCallback((newMap) => {
+    setSpeakerMap(newMap);
+  }, []);
+
+  function handleSeek(seconds) {
+    playerRef.current?.seekTo(seconds);
+  }
 
   async function handleConfirm() {
     setConfirming(true);
@@ -154,7 +151,7 @@ function StepTranscript({ meeting, transcript, onConfirm, onDiscard }) {
       Object.entries(speakerMap).filter(([, v]) => v.trim() !== "")
     );
     try {
-      await onConfirm({ speakerMap: filteredMap });
+      await onConfirm({ speakerMap: filteredMap, diarizedSegments: segments });
     } catch {
       setError("Could not confirm transcript. Try again.");
       setConfirming(false);
@@ -172,74 +169,49 @@ function StepTranscript({ meeting, transcript, onConfirm, onDiscard }) {
   }
 
   return (
-    <div className="max-w-[720px] mx-auto px-6 py-10 pb-28 flex flex-col gap-8">
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2">
+    <div className="flex flex-col min-h-screen">
+      {audioUrl && (
+        <AudioPlayer
+          ref={playerRef}
+          audioUrl={audioUrl}
+          contentType={audioContentType}
+          onTimeUpdate={setAudioCurrentTime}
+        />
+      )}
+
+      <div className="max-w-[720px] mx-auto px-6 py-8 pb-28 w-full flex flex-col gap-6">
+        <div className="flex flex-col gap-1">
           <span className="font-mono text-[10px] text-ink-4 tracking-[0.1em]">STEP 1 OF 2</span>
-        </div>
-        <h1 className="font-body font-semibold text-ink text-[18px] leading-snug">
-          Review Transcript
-        </h1>
-        <p className="font-body font-medium text-ink text-[14px]">{meeting.title}</p>
-        <span className="font-mono text-ink-4 text-[12px]">
-          {new Date(meeting.createdAt).toLocaleString()}
-        </span>
-      </div>
-
-      <section>
-        <SectionLabel label="Speakers Detected" />
-        <SpeakerMapper segments={segments} onChange={setSpeakerMap} />
-      </section>
-
-      <section>
-        <div className="flex items-center gap-3 mb-4">
-          <span className="font-mono text-[9px] tracking-[0.2em] uppercase text-ink-4 whitespace-nowrap">
-            Transcript
+          <h1 className="font-body font-semibold text-ink text-[18px] leading-snug">
+            Review Transcript
+          </h1>
+          <p className="font-body font-medium text-ink text-[14px]">{meeting.title}</p>
+          <span className="font-mono text-ink-4 text-[12px]">
+            {new Date(meeting.createdAt).toLocaleString()}
           </span>
-          <div className="flex-1 h-px bg-rule" />
-          <button
-            onClick={() => setTranscriptExpanded((v) => !v)}
-            className="font-mono text-[10px] text-ink-4 hover:text-ink-3 transition-colors duration-150 shrink-0"
-          >
-            {transcriptExpanded ? "Collapse" : "Expand"}
-          </button>
+          <p className="font-body font-light text-ink-4 text-[13px] mt-1">
+            Rename speakers by clicking their label. Edit any text inline. Then confirm.
+          </p>
         </div>
 
-        {segments.length === 0 ? (
-          <p className="font-body font-light text-ink-4 text-[13px]">
-            Transcript is not available.
-          </p>
-        ) : (
-          <div
-            className={`flex flex-col gap-4 ${transcriptExpanded ? "overflow-y-auto pr-1" : ""}`}
-            style={transcriptExpanded ? { maxHeight: "480px" } : undefined}
-          >
-            {visibleGroups.map((group, i) => (
-              <div key={i} className="flex flex-col gap-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-[9px] tracking-widest uppercase text-ink-4">
-                    {group.speaker}
-                  </span>
-                  <span className="font-mono text-[9px] text-ink-4">
-                    {formatTime(group.start)}
-                  </span>
-                </div>
-                <p className="font-body font-light text-[13px] text-ink-2 leading-[1.6]">
-                  {group.texts.join(" ")}
-                </p>
-              </div>
-            ))}
-            {!transcriptExpanded && grouped.length > 3 && (
-              <button
-                onClick={() => setTranscriptExpanded(true)}
-                className="font-body text-[13px] text-signal hover:text-signal/80 transition-colors duration-150 text-left"
-              >
-                Show full transcript ({grouped.length} blocks)
-              </button>
-            )}
-          </div>
-        )}
-      </section>
+        <section>
+          <SectionLabel label="Transcript" />
+          {segments.length === 0 ? (
+            <p className="font-body font-light text-ink-4 text-[13px]">
+              Transcript is not available.
+            </p>
+          ) : (
+            <TranscriptEditor
+              segments={segments}
+              speakerMap={speakerMap}
+              audioCurrentTime={audioCurrentTime}
+              onSegmentsChange={handleSegmentsChange}
+              onSpeakerMapChange={handleSpeakerMapChange}
+              onSeek={handleSeek}
+            />
+          )}
+        </section>
+      </div>
 
       <div className="fixed bottom-0 left-0 right-0 bg-surface border-t border-rule px-6 py-4">
         <div className="max-w-[720px] mx-auto w-full flex items-center justify-between gap-4">
@@ -247,7 +219,7 @@ function StepTranscript({ meeting, transcript, onConfirm, onDiscard }) {
             <p className="font-body text-[13px] text-danger">{error}</p>
           ) : (
             <p className="font-body font-light text-ink-4 text-[13px]">
-              Rename speakers above, then confirm to run AI analysis.
+              Rename speakers, correct text, then confirm to run AI analysis.
             </p>
           )}
           <div className="flex items-center gap-3 shrink-0">
@@ -289,7 +261,6 @@ function StepOutput({ meeting, output, employee, initialAttendees, onConfirm, on
   const [error, setError] = useState("");
 
   const textareaRef = useRef(null);
-
   const keyPoints = output?.keyPoints ?? [];
 
   function autoGrow(el) {
@@ -339,9 +310,7 @@ function StepOutput({ meeting, output, employee, initialAttendees, onConfirm, on
   return (
     <div className="max-w-[720px] mx-auto px-6 py-10 pb-28 flex flex-col gap-8">
       <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <span className="font-mono text-[10px] text-ink-4 tracking-[0.1em]">STEP 2 OF 2</span>
-        </div>
+        <span className="font-mono text-[10px] text-ink-4 tracking-[0.1em]">STEP 2 OF 2</span>
         <h1 className="font-body font-semibold text-ink text-[18px] leading-snug">
           Review Minutes & Action Items
         </h1>
@@ -401,15 +370,9 @@ function StepOutput({ meeting, output, employee, initialAttendees, onConfirm, on
         <Table>
           <TableHeader>
             <TableRow className="border-rule">
-              <TableHead className="font-body font-medium text-ink text-[13px] px-0 pb-2">
-                Task
-              </TableHead>
-              <TableHead className="font-body font-medium text-ink text-[13px] px-3 pb-2">
-                Owner
-              </TableHead>
-              <TableHead className="font-body font-medium text-ink text-[13px] px-3 pb-2">
-                Deadline
-              </TableHead>
+              <TableHead className="font-body font-medium text-ink text-[13px] px-0 pb-2">Task</TableHead>
+              <TableHead className="font-body font-medium text-ink text-[13px] px-3 pb-2">Owner</TableHead>
+              <TableHead className="font-body font-medium text-ink text-[13px] px-3 pb-2">Deadline</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -425,24 +388,13 @@ function StepOutput({ meeting, output, employee, initialAttendees, onConfirm, on
               actionItems.map((item, i) => (
                 <TableRow key={i} className="border-rule align-top">
                   <TableCell className="px-0 py-3 align-top">
-                    <EditableCell
-                      value={item.task}
-                      onChange={(v) => updateActionItem(i, "task", v)}
-                    />
+                    <EditableCell value={item.task} onChange={(v) => updateActionItem(i, "task", v)} />
                   </TableCell>
                   <TableCell className="px-3 py-3 align-top">
-                    <EditableCell
-                      value={item.owner}
-                      onChange={(v) => updateActionItem(i, "owner", v)}
-                      mono
-                    />
+                    <EditableCell value={item.owner} onChange={(v) => updateActionItem(i, "owner", v)} mono />
                   </TableCell>
                   <TableCell className="px-3 py-3 align-top">
-                    <EditableCell
-                      value={item.deadline ?? ""}
-                      onChange={(v) => updateActionItem(i, "deadline", v || null)}
-                      mono
-                    />
+                    <EditableCell value={item.deadline ?? ""} onChange={(v) => updateActionItem(i, "deadline", v || null)} mono />
                   </TableCell>
                 </TableRow>
               ))
@@ -467,13 +419,8 @@ function StepOutput({ meeting, output, employee, initialAttendees, onConfirm, on
           <ul className="flex flex-col gap-2">
             {keyPoints.map((point, i) => (
               <li key={i} className="flex gap-3 items-start">
-                <span
-                  className="bg-ink-4 shrink-0 mt-[6px]"
-                  style={{ width: "3px", height: "3px" }}
-                />
-                <span className="font-body text-[13px] text-ink-2 leading-[1.7]">
-                  {point}
-                </span>
+                <span className="bg-ink-4 shrink-0 mt-[6px]" style={{ width: "3px", height: "3px" }} />
+                <span className="font-body text-[13px] text-ink-2 leading-[1.7]">{point}</span>
               </li>
             ))}
           </ul>
@@ -519,6 +466,8 @@ export function Review() {
   const [meeting, setMeeting] = useState(null);
   const [transcript, setTranscript] = useState(null);
   const [output, setOutput] = useState(null);
+  const [audioUrl, setAudioUrl] = useState(null);
+  const [audioContentType, setAudioContentType] = useState("audio/mpeg");
   const [initialAttendees, setInitialAttendees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -534,9 +483,14 @@ export function Review() {
         }
 
         if (m.status === "transcript_reviewing") {
-          const t = await getMeetingTranscript(id);
+          const [t, audio] = await Promise.all([
+            getMeetingTranscript(id),
+            getAudioUrl(id),
+          ]);
           setMeeting(m);
           setTranscript(t);
+          setAudioUrl(audio.url);
+          setAudioContentType(audio.contentType);
         } else if (m.status === "reviewing") {
           const [o, t] = await Promise.all([
             getMeetingOutput(id),
@@ -545,7 +499,6 @@ export function Review() {
           setMeeting(m);
           setOutput(o);
 
-          // Pre-populate attendees from renamed speaker names in the confirmed transcript
           const segments = t?.diarizedSegments ?? [];
           const uniqueNames = [...new Set(segments.map((s) => s.speaker))].filter(Boolean);
           setInitialAttendees(uniqueNames.map((name) => ({ personId: null, name })));
@@ -562,8 +515,8 @@ export function Review() {
     load();
   }, [id]);
 
-  async function handleConfirmTranscript({ speakerMap }) {
-    await confirmTranscript(id, { speakerMap });
+  async function handleConfirmTranscript({ speakerMap, diarizedSegments }) {
+    await confirmTranscript(id, { speakerMap, diarizedSegments });
     navigate(`/meetings/${id}`);
   }
 
@@ -578,11 +531,7 @@ export function Review() {
   }
 
   if (loading) {
-    return (
-      <div className="max-w-[720px] mx-auto px-6 py-10">
-        <ReviewSkeleton />
-      </div>
-    );
+    return <ReviewSkeleton />;
   }
 
   if (error || !meeting) {
@@ -606,6 +555,8 @@ export function Review() {
       <StepTranscript
         meeting={meeting}
         transcript={transcript}
+        audioUrl={audioUrl}
+        audioContentType={audioContentType}
         onConfirm={handleConfirmTranscript}
         onDiscard={handleDiscard}
       />
