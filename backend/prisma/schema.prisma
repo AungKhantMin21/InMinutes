@@ -41,13 +41,14 @@ model Person {
 // ─── Meetings ────────────────────────────────────────────────────────────────
 
 model Meeting {
-  id          String    @id @default(cuid())
-  title       String
-  source      String    @default("upload")
-  audioKey    String?
-  status      String    @default("pending")
+  id               String    @id @default(cuid())
+  title            String
+  source           String    @default("upload")
+  audioKey         String?
+  audioContentType String?
+  status           String    @default("pending")
   // pending | uploading | transcribing | transcript_reviewing | analyzing | reviewing | done | failed | discarded
-  errorMsg    String?
+  errorMsg         String?
   attendees   Json      @default("[]")
   // [{personId: string|null, name: string}]
   createdAt   DateTime  @default(now())
