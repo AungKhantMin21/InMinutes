@@ -61,14 +61,18 @@ ${actionItemsList}
 Full Transcript:
 ${transcript}
 
-Format the minutes with these sections:
+Format the minutes with exactly these sections and no others:
 1. Meeting Summary
 2. Key Points Discussed
 3. Decisions Made
 4. Action Items & Assignments
 5. Next Steps
 
-Professional business language. Clear and concise.`;
+Rules:
+- Do NOT include an Attendees section or attendees list
+- Do NOT include "Minutes Prepared By", "Date Prepared", or any signature block
+- Do NOT include meeting date, time, or location headers
+- Professional business language. Clear and concise.`;
 
   return generate(prompt);
 }
