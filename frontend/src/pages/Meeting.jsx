@@ -14,6 +14,7 @@ const PROCESSING_MESSAGES = {
   transcribing: "Transcribing audio with speaker detection...",
   analyzing: "Analyzing with AI...",
   pending: "Queued for processing...",
+  transcript_reviewing: "Transcript ready for review...",
 };
 
 function Skeleton({ width = "w-full", height = "h-3" }) {
@@ -125,7 +126,7 @@ export function Meeting() {
         const data = await getMeeting(id);
         setMeeting(data);
 
-        if (data.status === "reviewing") {
+        if (data.status === "reviewing" || data.status === "transcript_reviewing") {
           navigate(`/meetings/${id}/review`);
           return data.status;
         }
@@ -283,7 +284,13 @@ export function Meeting() {
             </div>
 
             <TabsContent value="minutes" className="mt-0 pt-5" style={{ animation: "fadeIn 200ms ease" }}>
-              <MinutesView minutes={output?.meetingMinutes ?? ""} title={meeting.title} />
+              <MinutesView
+                minutes={output?.meetingMinutes ?? ""}
+                title={meeting.title}
+                attendees={meeting.attendees ?? []}
+                minutesPreparedBy={output?.minutesPreparedBy}
+                datePrepared={output?.datePrepared}
+              />
             </TabsContent>
 
             <TabsContent value="action-items" className="mt-0 pt-5" style={{ animation: "fadeIn 200ms ease" }}>

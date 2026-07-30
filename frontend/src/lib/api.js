@@ -59,16 +59,34 @@ export async function getMeetingOutput(id) {
   return res.data.data;
 }
 
-export async function confirmReview(id, { speakerMap, meetingMinutes, actionItems }) {
+export async function confirmTranscript(id, { speakerMap }) {
+  const res = await api.post(`/api/meetings/${id}/review/confirm-transcript`, { speakerMap });
+  return res.data.data;
+}
+
+export async function confirmReview(id, { speakerMap, meetingMinutes, actionItems, attendees, minutesPreparedBy, datePrepared }) {
   const res = await api.post(`/api/meetings/${id}/review/confirm`, {
     speakerMap,
     meetingMinutes,
     actionItems,
+    attendees,
+    minutesPreparedBy,
+    datePrepared,
   });
   return res.data.data;
 }
 
 export async function discardReview(id) {
   const res = await api.post(`/api/meetings/${id}/review/discard`);
+  return res.data.data;
+}
+
+export async function searchEmployees(q) {
+  const res = await api.get("/api/people/employees", { params: { q } });
+  return res.data.data;
+}
+
+export async function searchPersons(q) {
+  const res = await api.get("/api/people/persons", { params: { q } });
   return res.data.data;
 }

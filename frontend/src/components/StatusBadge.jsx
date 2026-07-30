@@ -19,6 +19,11 @@ const STATUS_CONFIG = {
     className: "font-mono bg-signal-light text-signal border-signal/20",
     style: { animation: "progressPulse 2s ease infinite" },
   },
+  transcript_reviewing: {
+    label: "Reviewing Transcript",
+    className: "font-mono bg-warning-light text-warning border-warning/20",
+    style: { animation: "progressPulse 2s ease infinite" },
+  },
   reviewing: {
     label: "Awaiting Review",
     className: "font-mono bg-warning-light text-warning border-warning/20",
