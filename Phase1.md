@@ -93,21 +93,23 @@ meeting-intel/
 │       │   │   ├── card.jsx
 │       │   │   ├── badge.jsx
 │       │   │   ├── tabs.jsx
-│       │   │   └── table.jsx
+│       │   │   ├── table.jsx
+│       │   │   └── input.jsx
 │       │   ├── UploadZone.jsx      # drag-and-drop + file picker
 │       │   ├── MeetingList.jsx     # list of past meetings
 │       │   ├── StatusBadge.jsx     # wraps shadcn Badge with status logic
-│       │   ├── SpeakerMapper.jsx   # rename Speaker A/B/C → real names
+│       │   ├── SpeakerMapper.jsx   # speaker label → real name (autocomplete search)
+│       │   ├── AttendeeList.jsx    # attendee add/remove with employee+person search
 │       │   ├── TranscriptView.jsx  # speaker-labeled transcript (read-only)
 │       │   ├── ActionItemsTable.jsx # wraps shadcn Table
-│       │   └── MinutesView.jsx     # minutes text + copy + export
+│       │   └── MinutesView.jsx     # minutes markdown + attendees + metadata footer
 │       ├── hooks/
-│       │   └── useAuth.js          # auth state — user, token, login, logout
+│       │   └── useAuth.js          # auth state — employee, login, logout, register
 │       └── pages/
 │           ├── Login.jsx           # email + password login form
-│           ├── Register.jsx        # name + email + password + role registration
-│           ├── Home.jsx            # meeting list + upload zone
-│           ├── Review.jsx          # HITL — review + edit + confirm before saving
+│           ├── Register.jsx        # name + email + password + job title registration
+│           ├── Home.jsx            # meeting list + upload zone + sign-out
+│           ├── Review.jsx          # 2-step HITL: StepTranscript + StepOutput
 │           └── Meeting.jsx         # single meeting — read-only tabbed output
 │
 └── backend/
@@ -118,7 +120,8 @@ meeting-intel/
     │   ├── routes/
     │   │   ├── auth.js             # register + login + me endpoints
     │   │   ├── upload.js           # presign + confirm endpoints
-    │   │   └── meetings.js         # CRUD + status + transcript + output
+    │   │   ├── meetings.js         # CRUD + status + transcript + output + HITL review
+    │   │   └── people.js           # employee search + person search endpoints
     │   ├── lib/
     │   │   ├── queue.js            # BullMQ queue definition + Redis connection
     │   │   ├── r2.js               # Cloudflare R2 — presigned upload + download URLs
@@ -218,17 +221,20 @@ model Meeting {
   audioKey     String?
   // Cloudflare R2 object key
   status       String    @default("pending")
-  // pending | uploading | transcribing | analyzing | reviewing | done | failed | discarded
-  // "reviewing" = AI done, waiting for human approval
-  // "done"      = human confirmed, output is final and read-only
-  // "discarded" = human discarded on review — soft state, record kept
+  // pending | uploading | transcribing | transcript_reviewing | analyzing | reviewing | done | failed | discarded
+  // "transcript_reviewing" = transcription done, waiting for human to review transcript
+  // "reviewing"            = AI analysis done, waiting for human to review output
+  // "done"                 = human confirmed, output is final and read-only
+  // "discarded"            = human discarded on review — soft state, record kept
   errorMsg     String?
+  attendees    Json      @default("[]")
+  // [{personId: string|null, name: string}] — set by human during Step 2 review
   createdAt    DateTime  @default(now())
   completedAt  DateTime?
 
-  uploadedBy   Employee  @relation(fields: [employeeId], references: [id])
-  employeeId   String
-  // who uploaded this meeting
+  uploadedBy   Employee? @relation(fields: [employeeId], references: [id])
+  employeeId   String?
+  // optional — null for meetings uploaded before auth was added
 
   transcript   Transcript?
   output       Output?
@@ -243,20 +249,24 @@ model Transcript {
   // plain text from AssemblyAI
   diarizedSegments Json
   // [{speaker, text, start, end}]
-  // speaker labels replaced with real names after HITL confirm
+  // speaker labels replaced with real names after Step 1 HITL confirm
   createdAt        DateTime @default(now())
 }
 
 model Output {
-  id             String   @id @default(cuid())
-  meetingId      String   @unique
-  meeting        Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
-  keyPoints      Json
+  id                String   @id @default(cuid())
+  meetingId         String   @unique
+  meeting           Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  keyPoints         Json
   // string[]
-  actionItems    Json
+  actionItems       Json
   // [{task, owner, deadline}]
-  meetingMinutes String
-  createdAt      DateTime @default(now())
+  meetingMinutes    String
+  minutesPreparedBy String?
+  // set by human during Step 2 review — defaults to logged-in employee name
+  datePrepared      String?
+  // set by human during Step 2 review — defaults to today's date
+  createdAt         DateTime @default(now())
 }
 
 // ─── Participant linking ──────────────────────────────────────────────────────
@@ -353,19 +363,38 @@ POST  /api/upload/confirm/:id            → { status: "queued" }
 GET   /api/meetings                      → meetings uploaded by current employee
                                            (admin sees all)
 
-GET   /api/meetings/:id                  → Meeting row (status, title, timestamps)
+GET   /api/meetings/:id                  → Meeting row (status, title, attendees, timestamps)
 GET   /api/meetings/:id/transcript       → { rawText, diarizedSegments }
-GET   /api/meetings/:id/output           → { keyPoints, actionItems, meetingMinutes }
+GET   /api/meetings/:id/output           → { keyPoints, actionItems, meetingMinutes,
+                                             minutesPreparedBy, datePrepared }
 
-POST  /api/meetings/:id/review/confirm   { speakerMap, meetingMinutes, actionItems }
-                                         — applies speaker names globally
-                                         — creates MeetingParticipant rows
+── Two-Step HITL Review ────────────────────────────────────────────────────────
+
+POST  /api/meetings/:id/review/confirm-transcript
+                                         { speakerMap }
+                                         — applies speakerMap to diarizedSegments in DB
+                                         — queues BullMQ "analyze" job
+                                         — status → "analyzing"
+                                         → { status: "analyzing" }
+
+POST  /api/meetings/:id/review/confirm   { speakerMap, meetingMinutes, actionItems,
+                                           attendees, minutesPreparedBy, datePrepared }
+                                         — attendees: [{personId, name}]
+                                           creates Person records for manual entries (personId null)
+                                         — saves attendees to Meeting.attendees
+                                         — saves minutesPreparedBy + datePrepared to Output
+                                         — creates MeetingParticipant rows per speakerMap entry
                                          — creates/links Person records per speaker
-                                         — saves edited output, status → "done"
+                                         — status → "done", completedAt set
                                          → { status: "done" }
 
 POST  /api/meetings/:id/review/discard   — status → "discarded"
                                          → { status: "discarded" }
+
+── People Search (require Authorization: Bearer <token>) ───────────────────────
+
+GET   /api/people/employees?q=           → [{id, name, jobTitle, personId}] (max 8)
+GET   /api/people/persons?q=             → [{id, canonicalName, jobTitle, email}] (max 8)
 ```
 
 ---
@@ -375,8 +404,12 @@ POST  /api/meetings/:id/review/discard   — status → "discarded"
 The worker runs as a **separate Railway service** (same repo, different start
 command). It must run continuously — it cannot be a serverless function.
 
+The worker handles two BullMQ job types dispatched on `job.name`.
+
+**Job type: `"process"` — Transcription only**
+
 ```
-Job received: { meetingId, audioKey, title }
+Job received: { meetingId, audioKey }
       ↓
 Status → "transcribing"
       ↓
@@ -387,24 +420,40 @@ AssemblyAI: transcribeWithDiarization(audioUrl)
       ↓
 Save Transcript via Prisma
       ↓
+Status → "transcript_reviewing"
+      ↓
+Frontend polling detects "transcript_reviewing" → redirects to /meetings/:id/review (Step 1)
+```
+
+**Job type: `"analyze"` — AI Intelligence only (queued by confirm-transcript endpoint)**
+
+```
+Job received: { meetingId, title }
+      ↓
 Status → "analyzing"
       ↓
-formatTranscript(segments) → "Speaker A: ...\nSpeaker B: ..."
+Read diarizedSegments from Transcript table (already has real speaker names)
+      ↓
+formatTranscript(segments) → "Real Name: ...\nReal Name: ..."
       ↓
 Gemini API (parallel):
   extractKeyPoints(formatted)   → string[]
   extractActionItems(formatted) → [{task, owner, deadline}]
       ↓
 generateMinutes(formatted, keyPoints, actionItems, title) → string
+  — prompt explicitly excludes: Attendees, Minutes Prepared By, Date Prepared
       ↓
 Save Output via Prisma (draft — not yet confirmed by human)
       ↓
 Status → "reviewing"
       ↓
-Frontend polling detects "reviewing" → redirects to /meetings/:id/review
+Frontend polling detects "reviewing" → redirects to /meetings/:id/review (Step 2)
+```
 
-On any error:
-  Status → "failed", errorMsg = error.message
+**On any error (either job type):**
+
+```
+Status → "failed", errorMsg = error.message
 ```
 
 ---
@@ -421,7 +470,8 @@ Do not simplify. Do not genericize. Use exactly as written.
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+// Note: gemini-2.5-flash is deprecated for new API users — use gemini-2.5-flash-lite
 
 async function generate(prompt) {
   const result = await model.generateContent(prompt);
@@ -468,15 +518,23 @@ Action Items:
 Full Transcript:
 {transcript}
 
-Format the minutes with these sections:
+Format the minutes with exactly these sections and no others:
 1. Meeting Summary
 2. Key Points Discussed
 3. Decisions Made
 4. Action Items & Assignments
 5. Next Steps
 
-Professional business language. Clear and concise.
+Rules:
+- Do NOT include an Attendees section or attendees list
+- Do NOT include "Minutes Prepared By", "Date Prepared", or any signature block
+- Do NOT include meeting date, time, or location headers
+- Professional business language. Clear and concise.
 ```
+
+**Why these rules exist:** Attendees, Minutes Prepared By, and Date Prepared are
+collected separately by the application during the Step 2 HITL review and stored
+in structured fields. Generating them in the minutes markdown would create duplicates.
 
 ### JSON Parse Safety
 
@@ -925,101 +983,95 @@ look correct by reading directly from the database.
 
 ---
 
-### 05 — Review Page (Human-in-the-Loop)
+### 05 — Review Page (Human-in-the-Loop) — Two-Step HITL
 
-This is the human approval step. The worker sets status to "reviewing" when
-AI processing is complete. The user is redirected here to review, edit, and
-confirm before output is saved as final.
+The HITL review is split into two steps. The worker first sets status to
+`transcript_reviewing` after transcription. The user reviews and confirms
+the transcript in Step 1, which triggers AI analysis. Once analysis completes
+(status `reviewing`), the user is redirected back for Step 2 to review output.
 
 ```
-□ Add two new API routes in backend/src/routes/meetings.js:
+✓ API routes in backend/src/routes/meetings.js:
+
+    POST /api/meetings/:id/review/confirm-transcript
+        — body: { speakerMap }
+        — applies speakerMap to diarizedSegments in Transcript table
+        — queues BullMQ "analyze" job → status "analyzing"
+        — return { status: "analyzing" }
 
     POST /api/meetings/:id/review/confirm
-        — body: { speakerMap, meetingMinutes, actionItems }
-        — speakerMap shape: { "Speaker A": "Real Name", "Speaker B": "Real Name" }
-        — apply speakerMap: replace all speaker labels in diarizedSegments
-          and meetingMinutes and actionItems owner fields
-        — prisma.output.update({ meetingMinutes, actionItems })
-        — prisma.transcript.update({ diarizedSegments: mappedSegments })
-        — prisma.meeting.update({ status: "done", completedAt: new Date() })
+        — body: { speakerMap, meetingMinutes, actionItems,
+                  attendees, minutesPreparedBy, datePrepared }
+        — saves attendees to Meeting.attendees (creates Person records for manual entries)
+        — saves minutesPreparedBy + datePrepared to Output
+        — creates MeetingParticipant rows + Person records per speaker
+        — status → "done", completedAt set
         — return { status: "done" }
 
     POST /api/meetings/:id/review/discard
-        — prisma.meeting.update({ status: "discarded" })
+        — status → "discarded"
         — return { status: "discarded" }
 
-□ Review.jsx — the HITL review and edit screen
+✓ Review.jsx — the HITL review shell
+    — Fetches meeting on mount, branches on status:
+        transcript_reviewing → renders StepTranscript
+        reviewing            → renders StepOutput
+    — Redirects to /meetings/:id if status is "done"
+    — Redirects to / if status is anything else
 
-    Page layout:
-    — Max-width 720px, centered, padding 24px
-    — "← Back" link top left → navigates to /
-    — Page heading: "Review Meeting Output"
-    — Meeting title + created date below heading (DM Mono, ink-4)
-    — Sections flow vertically, separated by section labels
+✓ StepTranscript (Step 1 of 2) — Transcript Review
+    — Header: "STEP 1 OF 2 — Review Transcript"
+    — Section 1: Speakers Detected
+        — SpeakerMapper.jsx with autocomplete search
+        — Each speaker row searches employees → persons as user types
+        — Picks from dropdown or types manually if no match found
+        — Blank = speaker label kept as-is
+    — Section 2: Transcript (expanded by default)
+        — Full diarized transcript, scrollable (max-height 480px)
+        — Collapse/expand toggle
+    — Bottom bar:
+        Left: "Discard" → POST /discard → navigate to /
+        Right: "Confirm Transcript →" → POST /confirm-transcript → navigate to /meetings/:id
+               (Meeting.jsx polls: analyzing → reviewing → back to /review for Step 2)
 
-    Section 1 — Speakers Detected
-    — SpeakerMapper.jsx component
-    — Shows one input row per detected unique speaker
-    — Left: "Speaker A" label (DM Mono, ink-4)
-    — Right: text input → user types real name
-    — Placeholder: "Enter name..." (ink-4)
-    — If user leaves blank → speaker label stays as-is ("Speaker A")
-    — Names are stored in local state until Confirm is clicked
+✓ StepOutput (Step 2 of 2) — Output Review
+    — Header: "STEP 2 OF 2 — Review Minutes & Action Items"
+    — Section 1: Attendees
+        — AttendeeList.jsx component
+        — Pre-populated with renamed speaker names from Step 1
+        — User can add more attendees or remove any
+        — Search: employees first → persons → manual entry auto-creates Person on confirm
+    — Section 2: Meeting Minutes
+        — Editable textarea, auto-grows, min-height 200px
+        — Footer below textarea (below a border-t):
+            "Minutes Prepared By" input — default: logged-in employee name
+            "Date Prepared" input — default: today's date (human-readable string)
+    — Section 3: Action Items — inline editable table (Task | Owner | Deadline)
+    — Section 4: Key Points — read-only bulleted list
+    — Bottom bar:
+        Left: "Discard" → POST /discard → navigate to /
+        Right: "Confirm & Save" → POST /confirm → navigate to /meetings/:id
 
-    Section 2 — Meeting Minutes
-    — Editable textarea (not a rich text editor — plain textarea)
-    — Pre-filled with AI-generated meetingMinutes
-    — Inter weight 300, 13px, line-height 1.8
-    — Border: border-rule, focus: border-rule-hi
-    — Min-height 200px, auto-grows with content
-    — User edits directly — no save button for this field,
-      value is submitted with the Confirm action
+✓ SpeakerMapper.jsx
+    — One row per unique speaker label derived from diarizedSegments
+    — Each row: DM Mono speaker label + SpeakerInput (autocomplete)
+    — SpeakerInput: debounced search (300ms) → employees → persons dropdown
+    — No match found → typed text is used as manual name
+    — Exposes speakerMap via onChange prop
 
-    Section 3 — Action Items
-    — shadcn Table: Task | Owner | Deadline
-    — Every cell is editable inline:
-        click cell → input appears with current value
-        press Enter or click away → value updates in local state
-    — "+ Add row" button below table adds a blank action item row
-    — Owner column pre-filled with speaker labels (will show real names
-      after speakerMap is applied on confirm)
-    — DM Mono for Owner + Deadline cells
-
-    Section 4 — Key Points (read-only)
-    — Bulleted list, Inter weight 400
-    — Label: "Key Points — read only" in ink-4
-    — Not editable — editing minutes covers any corrections needed
-
-    Section 5 — Transcript (read-only, collapsed by default)
-    — Section label with expand/collapse toggle
-    — Collapsed: shows first 3 segments only
-    — Expanded: full diarized transcript, scrollable
-    — Not editable
-
-    Bottom action bar (sticky):
-    — Left: shadcn Button secondary "Discard" → POST /discard → navigate to /
-    — Right: shadcn Button primary "Confirm & Save" → POST /confirm →
-             navigate to /meetings/:id
-
-    Confirm flow:
-    1. Build speakerMap from SpeakerMapper inputs (skip blanks)
-    2. POST /api/meetings/:id/review/confirm with { speakerMap, meetingMinutes, actionItems }
-    3. On success → navigate to /meetings/:id
-    4. Meeting.jsx will now show status "done" with confirmed output
-
-□ SpeakerMapper.jsx
-    — Accepts: segments (diarizedSegments array)
-    — Derives unique speaker labels from segments automatically
-    — Renders one input row per unique speaker
-    — Exposes: speakerMap object via onChange prop
-    — Parent (Review.jsx) holds the speakerMap in local state
+✓ AttendeeList.jsx
+    — Props: attendees [{personId, name}], onChange
+    — Debounced search (300ms) across /api/people/employees then /api/people/persons
+    — Employees shown first; persons already linked to employees are deduplicated
+    — No results → "Add [name]" option → {personId: null, name}
+    — On confirm, null personId entries create new Person records in DB
 ```
 
-**Definition of done:** After processing completes, user is redirected to
-Review page. Speaker names can be entered. Minutes are editable. Action
-items are editable inline. Confirm saves everything and redirects to the
-clean Meeting detail page. Discard sets status to discarded and redirects
-to Home.
+**Definition of done:** After upload + transcription, user lands on Step 1 to
+rename speakers and review transcript. After confirming transcript, AI analysis
+runs and user is returned to Step 2 to review minutes/action items/key points.
+Attendees pre-filled from speaker names. Confirm saves all structured metadata
+and sets status "done". Discard sets "discarded".
 
 ---
 
@@ -1306,67 +1358,6 @@ design system.
 
 ---
 
-### 09 — Deploy
-
-```
-□ backend/ → Railway
-    — Service 1 (api):    start = node src/index.js
-    — Service 2 (worker): start = node src/worker/index.js
-    — Add Postgres plugin → DATABASE_URL to env vars
-    — Add Redis plugin    → REDIS_URL to env vars
-    — Set all env vars: GEMINI_API_KEY, ASSEMBLYAI_API_KEY,
-                        R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
-                        R2_BUCKET_NAME, FRONTEND_URL
-    — Add to api start command: npx prisma migrate deploy && node src/index.js
-    — Verify both services start and connect
-
-□ frontend/ → Vercel
-    — Connect GitHub repo, root = /frontend, framework = Vite
-    — Set VITE_API_URL = Railway API production URL
-    — Update R2 CORS AllowedOrigins to include Vercel production domain
-    — Verify build passes
-
-□ Smoke test on production URLs:
-    — Upload a real meeting recording
-    — Watch status update: transcribing → analyzing → reviewing
-    — Verify redirect to Review page when reviewing status hits
-    — Enter real speaker names, edit minutes, edit an action item
-    — Confirm → verify redirect to Meeting detail with correct output
-    — Verify all 4 tabs render correct content with real names applied
-    — Test copy and export on confirmed output
-    — Test Discard flow → verify status shows discarded on Home list
-    — Verify failed state with a corrupted/unsupported file
-```
-
-**Definition of done:** Everything works on production URLs, not just
-localhost. A real meeting recording produces correct output end-to-end.
-
----
-
-### 10 — Proposal Prep
-
-```
-□ Test output quality on 2–3 real meeting recordings
-□ Record a short demo (2–3 minutes) showing full flow
-□ Build proposal deck (7 slides):
-    1. Problem — manual notes are slow, incomplete, action items get lost
-    2. Solution — upload any recording, full output in 10–15 minutes
-    3. Architecture — simplified system flow diagram
-    4. Data security — all outputs in own database;
-       Phase 2 option: fully self-hosted STT
-    5. Demo screenshots
-    6. Roadmap:
-       Phase 1 (now): file upload MVP
-       Phase 2: Microsoft Graph auto-sync when Teams meeting ends
-       Phase 3: self-hosted STT for full data sovereignty
-    7. What we need: AssemblyAI key (~$15/month), Railway (~$20/month),
-       5–10 person pilot group for 2 weeks
-```
-
-**Definition of done:** Proposal deck ready. Output quality on real content is strong enough to present to users.
-
----
-
 ## Current Status
 
 ```
@@ -1374,13 +1365,11 @@ localhost. A real meeting recording produces correct output end-to-end.
 ✓ 02 — Database + Infrastructure
 ✓ 03 — Upload Pipeline
 ✓ 04 — Worker: Transcription + Intelligence
-□ 05 — Review Page (Human-in-the-Loop)   ← CURRENT
-□ 05b — Auth + Person Registry Foundation
-□ 06 — Meeting Output UI
-□ 07 — Loading + Error + Empty States
-□ 08 — Polish Pass
-□ 09 — Deploy
-□ 10 — Proposal Prep
+✓ 05 — Review Page (Human-in-the-Loop) — extended to 2-step HITL
+✓ 05b — Auth + Person Registry Foundation
+✓ 06 — Meeting Output UI
+✓ 07 — Loading + Error + Empty States
+✓ 08 — Polish Pass
 ```
 
 ---
@@ -1388,52 +1377,39 @@ localhost. A real meeting recording produces correct output end-to-end.
 ## Definition of Phase 1 Complete
 
 ```
-□ User can upload a meeting recording (MP4, WebM, MP3, WAV, M4A — max 500MB)
-□ File uploads directly to Cloudflare R2 via presigned URL
-□ Background worker processes the recording automatically
-□ AssemblyAI transcribes audio with speaker diarization
-□ Gemini extracts key points, action items with owners, and meeting minutes
-□ Employees can register and log in — JWT auth
-□ Person record auto-created on registration — seeds the registry
-□ All routes protected — unauthenticated requests return 401
-□ Meetings linked to the uploading employee
-□ Meeting list scoped per employee (admin sees all)
-□ Worker sets status to "reviewing" — never directly to "done"
-□ User is redirected to Review page when processing completes
-□ User can rename Speaker A/B/C to real names — applied globally on confirm
-□ Confirm creates MeetingParticipant rows + Person records per speaker
-□ User can edit meeting minutes in the review step
-□ User can edit action items inline in the review step
-□ Confirm saves final output and sets status to "done"
-□ Discard sets status to "discarded" — record kept, not hard-deleted
-□ All confirmed outputs stored in own PostgreSQL database via Prisma
-□ Meeting detail page is fully read-only — shows confirmed output only
-□ All four output tabs render correctly: Minutes, Action Items, Key Points, Transcript
-□ Copy and markdown export work on confirmed meeting minutes
-□ All screens have loading, error, and empty states
+✓ User can upload a meeting recording (MP4, WebM, MP3, WAV, M4A — max 500MB)
+✓ File uploads directly to Cloudflare R2 via presigned URL
+✓ Background worker processes the recording automatically
+✓ AssemblyAI transcribes audio with speaker diarization
+✓ Gemini extracts key points, action items with owners, and meeting minutes
+✓ Employees can register and log in — JWT auth
+✓ Person record auto-created on registration — seeds the registry
+✓ All routes protected — unauthenticated requests return 401
+✓ Meetings linked to the uploading employee
+✓ Meeting list scoped per employee (admin sees all)
+✓ Worker transcription ends at "transcript_reviewing" — never skips human review
+✓ User reviews and confirms transcript in Step 1 (renames speakers via autocomplete)
+✓ AI analysis triggered after transcript confirmation — generates minutes/action items/key points
+✓ User reviews output in Step 2 (edit minutes, action items, add attendees)
+✓ Speaker labels renamed in Step 1 auto-populate the attendees list in Step 2
+✓ Attendees stored as structured list (not embedded in minutes markdown)
+✓ Minutes Prepared By and Date Prepared collected in Step 2 (defaults: current user + today)
+✓ Gemini prompt explicitly excludes attendees/prepared-by/date from generated minutes
+✓ Confirm creates MeetingParticipant rows + Person records per speaker
+✓ Manual attendee entries auto-create Person records on confirm
+✓ Employee and person search endpoints for autocomplete in review UI
+✓ Confirm saves final output and sets status to "done"
+✓ Discard sets status to "discarded" — record kept, not hard-deleted
+✓ All confirmed outputs stored in own PostgreSQL database via Prisma
+✓ Meeting detail page is fully read-only — shows confirmed output only
+✓ Attendees, Minutes Prepared By, Date Prepared shown separately in Minutes tab
+✓ All four output tabs render correctly: Minutes, Action Items, Key Points, Transcript
+✓ Copy and markdown export work on confirmed meeting minutes
+✓ All screens have loading, error, and empty states
 □ Production deploy is live on Railway + Vercel
-□ End-to-end flow tested with a real meeting recording
+□ End-to-end flow tested with a real meeting recording on production
 □ Proposal deck ready to present
 ```
-
----
-
-## Phase 2 (Post-MVP) — Microsoft Graph Integration
-
-When the MVP is validated and the proposal is approved:
-
-```
-□ Register Azure app in tenant (requires Teams admin)
-□ Add API permissions: OnlineMeetings.Read.All, CallRecords.Read.All
-□ POST /api/webhooks/teams — receive recording.ready notification
-□ Download recording from SharePoint via Graph API → upload to R2
-□ Call existing confirm endpoint → same BullMQ queue → same worker pipeline
-□ Add source = "teams" to Meeting record for tracking
-□ Zero changes to worker, intelligence layer, or frontend output views
-```
-
-The entire Phase 1 pipeline is untouched. Graph is one new webhook
-endpoint that feeds the existing queue.
 
 ---
 
