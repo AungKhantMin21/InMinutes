@@ -14,12 +14,18 @@ export async function transcribeWithDiarization(audioUrl) {
     throw new Error(`Transcription failed: ${transcript.error}`);
   }
 
-  const detectedLang = transcript.language_code ?? "en";
+  // AssemblyAI language_detection only gives a single code for the whole transcript,
+  // not per-utterance. Detect Burmese per-segment from Myanmar Unicode script range
+  // (U+1000–U+109F) which is unambiguous — Latin characters always resolve to "en".
+  function detectLang(text) {
+    if (/[က-႟]/.test(text)) return "my";
+    return "en";
+  }
 
   const segments = (transcript.utterances ?? []).map((u) => ({
     speaker: "Speaker " + u.speaker,
     text: u.text,
-    originalLang: u.language ?? detectedLang,
+    originalLang: detectLang(u.text),
     translatedText: null,
     start: u.start,
     end: u.end,
