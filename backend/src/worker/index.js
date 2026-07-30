@@ -11,9 +11,9 @@ import {
   generateMinutes,
 } from "../lib/intelligence.js";
 
-async function processJob(job) {
-  const { meetingId, audioKey, title } = job.data;
-  console.log(`Processing job — meetingId: ${meetingId}`);
+async function runTranscription(job) {
+  const { meetingId, audioKey } = job.data;
+  console.log(`Transcribing — meetingId: ${meetingId}`);
 
   await prisma.meeting.update({
     where: { id: meetingId },
@@ -21,8 +21,6 @@ async function processJob(job) {
   });
 
   const audioUrl = await getDownloadUrl(audioKey);
-  console.log(`Transcribing — meetingId: ${meetingId}`);
-
   const { rawText, segments } = await transcribeWithDiarization(audioUrl);
 
   await prisma.transcript.create({
@@ -31,11 +29,27 @@ async function processJob(job) {
 
   await prisma.meeting.update({
     where: { id: meetingId },
+    data: { status: "transcript_reviewing" },
+  });
+
+  console.log(`Transcript ready for review — meetingId: ${meetingId}`);
+}
+
+async function runAnalysis(job) {
+  const { meetingId, title } = job.data;
+  console.log(`Analyzing — meetingId: ${meetingId}`);
+
+  await prisma.meeting.update({
+    where: { id: meetingId },
     data: { status: "analyzing" },
   });
 
-  const formatted = formatTranscript(segments);
-  console.log(`Analyzing — meetingId: ${meetingId}`);
+  const transcript = await prisma.transcript.findUnique({
+    where: { meetingId },
+    select: { diarizedSegments: true },
+  });
+
+  const formatted = formatTranscript(transcript.diarizedSegments);
 
   const [keyPoints, actionItems] = await Promise.all([
     extractKeyPoints(formatted),
@@ -53,7 +67,12 @@ async function processJob(job) {
     data: { status: "reviewing" },
   });
 
-  console.log(`Awaiting review — meetingId: ${meetingId}`);
+  console.log(`Awaiting output review — meetingId: ${meetingId}`);
+}
+
+async function processJob(job) {
+  if (job.name === "analyze") return runAnalysis(job);
+  return runTranscription(job);
 }
 
 const worker = new Worker("meeting-processing", processJob, { connection: redis });

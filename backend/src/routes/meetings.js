@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../lib/db.js";
+import { meetingQueue } from "../lib/queue.js";
 
 const router = Router();
 
@@ -34,6 +35,7 @@ router.get("/:id", async (req, res) => {
         status: true,
         source: true,
         errorMsg: true,
+        attendees: true,
         createdAt: true,
         completedAt: true,
       },
@@ -70,7 +72,13 @@ router.get("/:id/output", async (req, res) => {
   try {
     const output = await prisma.output.findUnique({
       where: { meetingId: req.params.id },
-      select: { keyPoints: true, actionItems: true, meetingMinutes: true },
+      select: {
+        keyPoints: true,
+        actionItems: true,
+        meetingMinutes: true,
+        minutesPreparedBy: true,
+        datePrepared: true,
+      },
     });
 
     if (!output) {
@@ -83,8 +91,8 @@ router.get("/:id/output", async (req, res) => {
   }
 });
 
-router.post("/:id/review/confirm", async (req, res) => {
-  const { speakerMap, meetingMinutes, actionItems } = req.body;
+router.post("/:id/review/confirm-transcript", async (req, res) => {
+  const { speakerMap } = req.body;
 
   try {
     const transcript = await prisma.transcript.findUnique({
@@ -98,10 +106,51 @@ router.post("/:id/review/confirm", async (req, res) => {
 
     const mappedSegments = transcript.diarizedSegments.map((seg) => ({
       ...seg,
-      speaker: speakerMap[seg.speaker] || seg.speaker,
+      speaker: (speakerMap && speakerMap[seg.speaker]) || seg.speaker,
     }));
 
-    const mappedMinutes = Object.entries(speakerMap).reduce(
+    await prisma.transcript.update({
+      where: { meetingId: req.params.id },
+      data: { diarizedSegments: mappedSegments },
+    });
+
+    const meeting = await prisma.meeting.findUnique({
+      where: { id: req.params.id },
+      select: { title: true },
+    });
+
+    await prisma.meeting.update({
+      where: { id: req.params.id },
+      data: { status: "analyzing" },
+    });
+
+    await meetingQueue.add("analyze", { meetingId: req.params.id, title: meeting.title });
+
+    res.json({ data: { status: "analyzing" } });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to confirm transcript" });
+  }
+});
+
+router.post("/:id/review/confirm", async (req, res) => {
+  const { speakerMap, meetingMinutes, actionItems, attendees, minutesPreparedBy, datePrepared } = req.body;
+
+  try {
+    const transcript = await prisma.transcript.findUnique({
+      where: { meetingId: req.params.id },
+      select: { diarizedSegments: true },
+    });
+
+    if (!transcript) {
+      return res.status(404).json({ error: "Transcript not found" });
+    }
+
+    const mappedSegments = transcript.diarizedSegments.map((seg) => ({
+      ...seg,
+      speaker: (speakerMap && speakerMap[seg.speaker]) || seg.speaker,
+    }));
+
+    const mappedMinutes = Object.entries(speakerMap ?? {}).reduce(
       (text, [original, replacement]) =>
         replacement ? text.replaceAll(original, replacement) : text,
       meetingMinutes
@@ -109,7 +158,7 @@ router.post("/:id/review/confirm", async (req, res) => {
 
     const mappedActionItems = actionItems.map((item) => ({
       ...item,
-      owner: speakerMap[item.owner] || item.owner,
+      owner: (speakerMap && speakerMap[item.owner]) || item.owner,
     }));
 
     await prisma.transcript.update({
@@ -119,15 +168,37 @@ router.post("/:id/review/confirm", async (req, res) => {
 
     await prisma.output.update({
       where: { meetingId: req.params.id },
-      data: { meetingMinutes: mappedMinutes, actionItems: mappedActionItems },
+      data: {
+        meetingMinutes: mappedMinutes,
+        actionItems: mappedActionItems,
+        minutesPreparedBy: minutesPreparedBy ?? null,
+        datePrepared: datePrepared ?? null,
+      },
     });
+
+    // Resolve attendees — create Person records for manual entries
+    const resolvedAttendees = [];
+    for (const attendee of (attendees ?? [])) {
+      if (attendee.personId) {
+        resolvedAttendees.push(attendee);
+      } else {
+        const person = await prisma.person.create({
+          data: { canonicalName: attendee.name, aliases: [attendee.name] },
+        });
+        resolvedAttendees.push({ personId: person.id, name: attendee.name });
+      }
+    }
 
     await prisma.meeting.update({
       where: { id: req.params.id },
-      data: { status: "done", completedAt: new Date() },
+      data: {
+        status: "done",
+        completedAt: new Date(),
+        attendees: resolvedAttendees,
+      },
     });
 
-    for (const [speakerLabel, realName] of Object.entries(speakerMap)) {
+    for (const [speakerLabel, realName] of Object.entries(speakerMap ?? {})) {
       if (!realName) continue;
 
       let person = await prisma.person.findFirst({

@@ -46,7 +46,10 @@ model Meeting {
   source      String    @default("upload")
   audioKey    String?
   status      String    @default("pending")
+  // pending | uploading | transcribing | transcript_reviewing | analyzing | reviewing | done | failed | discarded
   errorMsg    String?
+  attendees   Json      @default("[]")
+  // [{personId: string|null, name: string}]
   createdAt   DateTime  @default(now())
   completedAt DateTime?
 
@@ -68,13 +71,15 @@ model Transcript {
 }
 
 model Output {
-  id             String   @id @default(cuid())
-  meetingId      String   @unique
-  meeting        Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
-  keyPoints      Json
-  actionItems    Json
-  meetingMinutes String
-  createdAt      DateTime @default(now())
+  id                String   @id @default(cuid())
+  meetingId         String   @unique
+  meeting           Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  keyPoints         Json
+  actionItems       Json
+  meetingMinutes    String
+  minutesPreparedBy String?
+  datePrepared      String?
+  createdAt         DateTime @default(now())
 }
 
 // ─── Participant linking ──────────────────────────────────────────────────────

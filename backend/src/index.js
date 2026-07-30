@@ -7,6 +7,7 @@ import { authenticate } from "./middleware/auth.js";
 import authRouter from "./routes/auth.js";
 import uploadRouter from "./routes/upload.js";
 import meetingsRouter from "./routes/meetings.js";
+import peopleRouter from "./routes/people.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,6 +18,7 @@ app.use(express.json());
 app.use("/api/auth", authRouter);
 app.use("/api/upload", authenticate, uploadRouter);
 app.use("/api/meetings", authenticate, meetingsRouter);
+app.use("/api/people", authenticate, peopleRouter);
 
 app.get("/api/health", (_req, res) => {
   res.json({ data: { status: "ok" } });
