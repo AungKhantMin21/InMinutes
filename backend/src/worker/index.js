@@ -3,7 +3,7 @@ import { Worker } from "bullmq";
 import { redis } from "../lib/queue.js";
 import { prisma } from "../lib/db.js";
 import { getDownloadUrl } from "../lib/r2.js";
-import { transcribeWithDiarization } from "../lib/assemblyai.js";
+import { transcribeAudio } from "../lib/elevenlabs.js";
 import {
   translateNonEnglishSegments,
   buildEnglishTranscript,
@@ -13,7 +13,7 @@ import {
 } from "../lib/intelligence.js";
 
 async function runTranscription(job) {
-  const { meetingId, audioKey } = job.data;
+  const { meetingId, audioKey, audioContentType, speakersExpected } = job.data;
   console.log(`Transcribing — meetingId: ${meetingId}`);
 
   await prisma.meeting.update({
@@ -22,12 +22,20 @@ async function runTranscription(job) {
   });
 
   const audioUrl = await getDownloadUrl(audioKey);
-  const { rawText, segments: rawSegments } = await transcribeWithDiarization(audioUrl);
+  const mimeType = audioContentType ?? "audio/mpeg";
 
+  const audioRes = await fetch(audioUrl);
+  const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+
+  const rawSegments = await transcribeAudio(audioBuffer, mimeType, speakersExpected ?? null);
   const segments = await translateNonEnglishSegments(rawSegments);
 
   await prisma.transcript.create({
-    data: { meetingId, rawText, diarizedSegments: segments },
+    data: {
+      meetingId,
+      rawText: segments.map((s) => s.text).join(" "),
+      diarizedSegments: segments,
+    },
   });
 
   await prisma.meeting.update({
