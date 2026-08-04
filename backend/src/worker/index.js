@@ -24,10 +24,13 @@ async function runTranscription(job) {
   const audioUrl = await getDownloadUrl(audioKey);
   const mimeType = audioContentType ?? "audio/mpeg";
 
+  console.log(`Downloading audio — meetingId: ${meetingId}`);
   const audioRes = await fetch(audioUrl);
   const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+  console.log(`Audio downloaded (${(audioBuffer.length / 1024 / 1024).toFixed(1)} MB) — sending to Scribe v2`);
 
   const rawSegments = await transcribeAudio(audioBuffer, mimeType, speakersExpected ?? null);
+  console.log(`Scribe v2 done — ${rawSegments.length} segments`);
   const segments = await translateNonEnglishSegments(rawSegments);
 
   await prisma.transcript.create({
