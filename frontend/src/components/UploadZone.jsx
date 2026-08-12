@@ -22,6 +22,7 @@ export function UploadZone() {
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState(null);
   const [title, setTitle] = useState("");
+  const [speakersExpected, setSpeakersExpected] = useState("");
   const [progress, setProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
@@ -89,7 +90,8 @@ export function UploadZone() {
         xhr.send(file);
       });
 
-      await confirmUpload(meetingId);
+      const speakers = speakersExpected ? parseInt(speakersExpected, 10) : null;
+      await confirmUpload(meetingId, speakers);
       navigate(`/meetings/${meetingId}`);
     } catch (err) {
       setError("Upload failed. Check your connection and try again.");
@@ -142,6 +144,16 @@ export function UploadZone() {
             placeholder="Meeting title"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
+            disabled={uploading}
+            className="w-full px-3 py-2 border border-rule bg-white font-body text-ink text-sm outline-none focus:border-rule-hi placeholder:text-ink-4 disabled:opacity-60"
+          />
+          <input
+            type="number"
+            placeholder="Number of speakers (optional)"
+            min="1"
+            max="32"
+            value={speakersExpected}
+            onChange={(e) => setSpeakersExpected(e.target.value)}
             disabled={uploading}
             className="w-full px-3 py-2 border border-rule bg-white font-body text-ink text-sm outline-none focus:border-rule-hi placeholder:text-ink-4 disabled:opacity-60"
           />

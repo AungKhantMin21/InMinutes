@@ -34,8 +34,8 @@ export async function presignUpload({ filename, contentType, title }) {
   return res.data.data;
 }
 
-export async function confirmUpload(meetingId) {
-  const res = await api.post(`/api/upload/confirm/${meetingId}`);
+export async function confirmUpload(meetingId, speakersExpected = null) {
+  const res = await api.post(`/api/upload/confirm/${meetingId}`, { speakersExpected });
   return res.data.data;
 }
 

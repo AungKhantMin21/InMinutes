@@ -32,10 +32,11 @@ router.post("/presign", async (req, res) => {
 router.post("/confirm/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const { speakersExpected } = req.body;
 
     const meeting = await prisma.meeting.findUnique({
       where: { id },
-      select: { id: true, audioKey: true, title: true },
+      select: { id: true, audioKey: true, title: true, audioContentType: true },
     });
 
     if (!meeting) {
@@ -51,6 +52,8 @@ router.post("/confirm/:id", async (req, res) => {
       meetingId: meeting.id,
       audioKey: meeting.audioKey,
       title: meeting.title,
+      audioContentType: meeting.audioContentType,
+      speakersExpected: speakersExpected ?? null,
     });
 
     res.json({ data: { status: "queued" } });
