@@ -19,7 +19,7 @@ function useDebouncedCallback(fn, delay) {
   );
 }
 
-function SpeakerDropdown({ currentLabel, onSelect, onClose }) {
+function SpeakerDropdown({ onSelect, onClose }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
   const inputRef = useRef(null);
@@ -65,10 +65,6 @@ function SpeakerDropdown({ currentLabel, onSelect, onClose }) {
     search(val);
   }
 
-  function handleKey(e) {
-    if (e.key === "Escape") onClose();
-  }
-
   return (
     <div
       ref={containerRef}
@@ -80,7 +76,7 @@ function SpeakerDropdown({ currentLabel, onSelect, onClose }) {
           ref={inputRef}
           value={query}
           onChange={handleInput}
-          onKeyDown={handleKey}
+          onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}
           placeholder="Search name..."
           className="w-full font-body text-[13px] text-ink outline-none placeholder:text-ink-4 bg-transparent"
         />
@@ -120,21 +116,20 @@ function SegmentBlock({
   segment,
   displaySpeaker,
   isActive,
-  onSpeakerRename,
+  onGlobalRename,
+  onLocalOverride,
+  onResetOverride,
   onTextChange,
   onTranslationChange,
   onSeek,
 }) {
-  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [globalDropdownOpen, setGlobalDropdownOpen] = useState(false);
+  const [localDropdownOpen, setLocalDropdownOpen] = useState(false);
   const [editingText, setEditingText] = useState(false);
   const [editingTranslation, setEditingTranslation] = useState(false);
   const textRef = useRef(null);
   const translationRef = useRef(null);
-
-  function handleSpeakerSelect(name) {
-    onSpeakerRename(segment.speaker, name);
-    setDropdownOpen(false);
-  }
 
   function handleTextBlur() {
     setEditingText(false);
@@ -149,14 +144,14 @@ function SegmentBlock({
   }
 
   function handleTextKey(e) {
-    if (e.key === "Escape") { e.preventDefault(); textRef.current?.blur(); }
-    if (e.key === "Enter") { e.preventDefault(); textRef.current?.blur(); }
+    if (e.key === "Escape" || e.key === "Enter") { e.preventDefault(); textRef.current?.blur(); }
   }
 
   function handleTranslationKey(e) {
-    if (e.key === "Escape") { e.preventDefault(); translationRef.current?.blur(); }
-    if (e.key === "Enter") { e.preventDefault(); translationRef.current?.blur(); }
+    if (e.key === "Escape" || e.key === "Enter") { e.preventDefault(); translationRef.current?.blur(); }
   }
+
+  const showControls = hovered && !editingText && !editingTranslation;
 
   return (
     <div
@@ -165,24 +160,67 @@ function SegmentBlock({
         borderLeftColor: isActive ? "var(--signal)" : "transparent",
         backgroundColor: isActive ? "rgba(239, 244, 255, 0.3)" : "transparent",
       }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => {
+        if (!globalDropdownOpen && !localDropdownOpen) setHovered(false);
+      }}
     >
       <div className="flex items-center gap-2 mb-1.5 relative">
+
+        {/* Speaker label — global rename on hover */}
         <div className="relative">
-          <button
-            onClick={() => setDropdownOpen((o) => !o)}
-            className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4 hover:text-ink-3 transition-colors duration-150 flex items-center gap-1"
-          >
-            {displaySpeaker}
-            <span className="text-[8px]">▾</span>
-          </button>
-          {dropdownOpen && (
+          {showControls || globalDropdownOpen ? (
+            <button
+              onClick={() => { setGlobalDropdownOpen((o) => !o); setLocalDropdownOpen(false); }}
+              className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4 hover:text-ink-3 transition-colors duration-150 flex items-center gap-1"
+            >
+              {displaySpeaker}
+              <span className="text-[8px]">▾</span>
+            </button>
+          ) : (
+            <span className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4">
+              {displaySpeaker}
+            </span>
+          )}
+          {globalDropdownOpen && (
             <SpeakerDropdown
-              currentLabel={segment.speaker}
-              onSelect={handleSpeakerSelect}
-              onClose={() => setDropdownOpen(false)}
+              onSelect={(name) => { onGlobalRename(name); setGlobalDropdownOpen(false); setHovered(false); }}
+              onClose={() => { setGlobalDropdownOpen(false); setHovered(false); }}
             />
           )}
         </div>
+
+        {/* Local override button — only on hover */}
+        {(showControls || localDropdownOpen) && (
+          <div className="relative">
+            <button
+              onClick={() => { setLocalDropdownOpen((o) => !o); setGlobalDropdownOpen(false); }}
+              title="Reassign this segment only"
+              className="font-mono text-[9px] text-ink-4 hover:text-ink-3 transition-colors duration-150"
+            >
+              ↻
+            </button>
+            {localDropdownOpen && (
+              <SpeakerDropdown
+                onSelect={(name) => { onLocalOverride(name); setLocalDropdownOpen(false); setHovered(false); }}
+                onClose={() => { setLocalDropdownOpen(false); setHovered(false); }}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Reassigned indicator */}
+        {segment.speakerOverride && (
+          <span className="font-mono text-[9px] text-ink-4 flex items-center gap-1">
+            · reassigned
+            <button
+              onClick={onResetOverride}
+              className="text-ink-4 hover:text-danger transition-colors duration-150"
+            >
+              × reset
+            </button>
+          </span>
+        )}
 
         {segment.originalLang && segment.originalLang !== "en" && (
           <span className="font-mono text-[8px] tracking-[0.12em] uppercase text-ink-4 bg-ground px-1 py-0.5 border border-rule">
@@ -254,9 +292,39 @@ export function TranscriptEditor({
     onSegmentsChange?.(segs);
   }, 500);
 
-  function handleSpeakerRename(originalLabel, newName) {
-    const newMap = { ...(speakerMap ?? {}), [originalLabel]: newName };
+  function handleGlobalRename(index, newName) {
+    const seg = segments[index];
+    const originalSpeaker = seg.originalSpeaker ?? seg.speaker;
+
+    const newMap = { ...(speakerMap ?? {}), [originalSpeaker]: newName };
     onSpeakerMapChange?.(newMap);
+
+    const updated = segments.map((s) => {
+      if ((s.originalSpeaker ?? s.speaker) !== originalSpeaker) return s;
+      if (s.speakerOverride) return s;
+      return { ...s, speaker: newName };
+    });
+    setSegments(updated);
+    notifyChange(updated);
+  }
+
+  function handleLocalOverride(index, newName) {
+    const updated = segments.map((s, i) =>
+      i === index ? { ...s, speaker: newName, speakerOverride: true } : s
+    );
+    setSegments(updated);
+    notifyChange(updated);
+  }
+
+  function handleResetOverride(index) {
+    const seg = segments[index];
+    const originalSpeaker = seg.originalSpeaker ?? seg.speaker;
+    const resetName = (speakerMap ?? {})[originalSpeaker] ?? originalSpeaker;
+    const updated = segments.map((s, i) =>
+      i === index ? { ...s, speaker: resetName, speakerOverride: false } : s
+    );
+    setSegments(updated);
+    notifyChange(updated);
   }
 
   function handleTextChange(index, newText) {
@@ -274,7 +342,9 @@ export function TranscriptEditor({
   }
 
   function getDisplaySpeaker(seg) {
-    return (speakerMap && speakerMap[seg.speaker]) || seg.speaker;
+    if (seg.speakerOverride) return seg.speaker;
+    const originalSpeaker = seg.originalSpeaker ?? seg.speaker;
+    return (speakerMap ?? {})[originalSpeaker] ?? originalSpeaker;
   }
 
   function isActiveSegment(seg) {
@@ -290,7 +360,9 @@ export function TranscriptEditor({
           segment={seg}
           displaySpeaker={getDisplaySpeaker(seg)}
           isActive={isActiveSegment(seg)}
-          onSpeakerRename={handleSpeakerRename}
+          onGlobalRename={(name) => handleGlobalRename(i, name)}
+          onLocalOverride={(name) => handleLocalOverride(i, name)}
+          onResetOverride={() => handleResetOverride(i)}
           onTextChange={(text) => handleTextChange(i, text)}
           onTranslationChange={(text) => handleTranslationChange(i, text)}
           onSeek={onSeek}
