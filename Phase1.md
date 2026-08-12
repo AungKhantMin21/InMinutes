@@ -30,8 +30,9 @@ Backend:      Express.js + Node.js
 Database:     PostgreSQL (Railway managed)
 ORM:          Prisma
 Queue:        BullMQ + Redis (Railway managed)
-STT:          AssemblyAI SDK — transcription + speaker diarization
-AI:           Google Gemini API — gemini-2.5-flash (all intelligence tasks)
+STT:          ElevenLabs Scribe v2 — Burmese + English transcription, speaker diarization,
+              word-level timestamps, keyterm prompting — single API call
+AI:           Google Gemini API — gemini-2.5-flash (transcription + translation + intelligence)
 File Storage: Cloudflare R2 (S3-compatible)
 Hosting:      Vercel (frontend) + Railway (backend API + worker)
 HTTP:         Axios
@@ -42,6 +43,12 @@ HTTP:         Axios
 - `bcryptjs` — password hashing
 - `jsonwebtoken` — JWT generation and verification
 - No Passport.js, no Auth0, no NextAuth — custom JWT only
+
+**Why ElevenLabs Scribe v2 over AssemblyAI:**
+AssemblyAI cannot transcribe Burmese — it misidentifies it as Japanese, Vietnamese,
+or Chinese. Scribe v2 explicitly supports Burmese (`mya`) with industry-leading
+accuracy, speaker diarization, and word-level timestamps in a single API call.
+It is also cheaper: $0.22/hour vs AssemblyAI's $0.72/hour ($0.012/min × 60).
 
 **Dependency rules:**
 
@@ -100,7 +107,9 @@ meeting-intel/
 │       │   ├── StatusBadge.jsx     # wraps shadcn Badge with status logic
 │       │   ├── SpeakerMapper.jsx   # speaker label → real name (autocomplete search)
 │       │   ├── AttendeeList.jsx    # attendee add/remove with employee+person search
-│       │   ├── TranscriptView.jsx  # speaker-labeled transcript (read-only)
+│       │   ├── AudioPlayer.jsx     # persistent audio player synced to transcript
+│       │   ├── TranscriptEditor.jsx # editable transcript with audio sync + lang badges
+│       │   ├── TranscriptView.jsx  # speaker-labeled transcript (read-only, Meeting page)
 │       │   ├── ActionItemsTable.jsx # wraps shadcn Table
 │       │   └── MinutesView.jsx     # minutes markdown + attendees + metadata footer
 │       ├── hooks/
@@ -125,8 +134,8 @@ meeting-intel/
     │   ├── lib/
     │   │   ├── queue.js            # BullMQ queue definition + Redis connection
     │   │   ├── r2.js               # Cloudflare R2 — presigned upload + download URLs
-    │   │   ├── assemblyai.js       # STT + speaker diarization
-    │   │   └── intelligence.js     # Gemini API — key points, action items, minutes
+    │   │   ├── elevenlabs.js       # ElevenLabs Scribe v2 — transcription + diarization + timestamps
+    │   │   └── intelligence.js     # Gemini API — translation, key points, action items, minutes
     │   └── worker/
     │       └── index.js            # BullMQ worker — runs as separate Railway service
     └── prisma/
@@ -143,7 +152,7 @@ PORT=3000
 DATABASE_URL=postgresql://...
 REDIS_URL=redis://...
 GEMINI_API_KEY=
-ASSEMBLYAI_API_KEY=
+ELEVENLABS_API_KEY=
 R2_ACCOUNT_ID=
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
@@ -218,8 +227,11 @@ model Meeting {
   title        String
   source       String    @default("upload")
   // upload | teams (Phase 2)
-  audioKey     String?
+  audioKey         String?
   // Cloudflare R2 object key
+  audioContentType String?
+  // MIME type of uploaded file: "video/mp4" | "audio/mpeg" | "audio/wav" | "audio/mp4" | "video/webm"
+  // stored at upload time — used by AudioPlayer to set correct <source type>
   status       String    @default("pending")
   // pending | uploading | transcribing | transcript_reviewing | analyzing | reviewing | done | failed | discarded
   // "transcript_reviewing" = transcription done, waiting for human to review transcript
@@ -248,7 +260,15 @@ model Transcript {
   rawText          String
   // plain text from AssemblyAI
   diarizedSegments Json
-  // [{speaker, text, start, end}]
+  // ElevenLabs Scribe v2 output — single-pass transcription + diarization:
+  // [{
+  //   speaker: string,          // "speaker_0", "speaker_1" etc from Scribe
+  //   text: string,             // original text (Burmese, English, or mixed)
+  //   originalLang: string,     // "en" | "my" | "my-en" (detected via Unicode heuristic)
+  //   translatedText: string|null, // English translation — null if already English
+  //   start: number,            // milliseconds — word-level from Scribe
+  //   end: number               // milliseconds — word-level from Scribe
+  // }]
   // speaker labels replaced with real names after Step 1 HITL confirm
   createdAt        DateTime @default(now())
 }
@@ -316,7 +336,7 @@ Railway Project: in-minutes
 ### Cloudflare R2
 
 - S3-compatible — uses AWS SDK v3
-- Browser uploads direct via presigly to R2ned URL (never through Express)
+- Browser uploads directly to R2 via presigned URL (never through Express)
 - CORS must allow PUT from localhost:5173 and Vercel production domain
 - Audio files stay in R2 permanently — never moved or deleted in MVP
 
@@ -368,11 +388,18 @@ GET   /api/meetings/:id/transcript       → { rawText, diarizedSegments }
 GET   /api/meetings/:id/output           → { keyPoints, actionItems, meetingMinutes,
                                              minutesPreparedBy, datePrepared }
 
+GET   /api/meetings/:id/audio-url        → { url, contentType }
+                                           url: presigned R2 URL (2hr expiry)
+                                           contentType: stored MIME type of original upload
+
 ── Two-Step HITL Review ────────────────────────────────────────────────────────
 
 POST  /api/meetings/:id/review/confirm-transcript
-                                         { speakerMap }
-                                         — applies speakerMap to diarizedSegments in DB
+                                         { speakerMap, diarizedSegments }
+                                         — diarizedSegments: edited segments from TranscriptEditor
+                                           (user may have corrected text or translations)
+                                         — applies speakerMap to segment speaker labels
+                                         — saves edited diarizedSegments back to Transcript table
                                          — queues BullMQ "analyze" job
                                          — status → "analyzing"
                                          → { status: "analyzing" }
@@ -406,55 +433,147 @@ command). It must run continuously — it cannot be a serverless function.
 
 The worker handles two BullMQ job types dispatched on `job.name`.
 
-**Job type: `"process"` — Transcription only**
+### Why ElevenLabs Scribe v2
+
+Previous approach used AssemblyAI for diarization and Gemini File
+API for transcription, merged by timestamp alignment. This was complex and
+fragile. Scribe v2 replaces both with a single API call:
+
+- Burmese language support (`mya`) — explicitly supported, not misidentified
+- Intra-sentence Burmese-English code-switching handled natively
+- Speaker diarization built in — no separate diarization service needed
+- Word-level timestamps — no alignment step needed
+- Keyterm prompting — feed company/product names to improve accuracy
+- Cheaper than AssemblyAI: $0.22/hour vs $0.72/hour
+
+The pipeline is now clean and single-pass again.
+
+---
+
+**Job type: `"process"` — Transcription (Scribe v2)**
 
 ```
-Job received: { meetingId, audioKey }
+Job received: { meetingId, audioKey, audioContentType, speakersExpected }
       ↓
 Status → "transcribing"
       ↓
 getDownloadUrl(audioKey) → presigned R2 URL
+Download audio from R2 → buffer
       ↓
-AssemblyAI: transcribeWithDiarization(audioUrl)
-  → { rawText, segments: [{speaker, text, start, end}] }
+ElevenLabs Scribe v2: transcribeAudio(buffer, audioContentType, speakersExpected)
+  Config: {
+    model_id: "scribe_v2",
+    language_code: "mya",            // Burmese primary — handles EN/MY mixing
+    diarize: true,                   // speaker diarization enabled
+    timestamps_granularity: "word",  // word-level timestamps
+    keyterms: ZARLA_KEYTERMS,        // company/product names (see below)
+    num_speakers: speakersExpected ?? undefined  // null → auto-detect
+  }
+  → Scribe JSON response with words array and speaker labels
       ↓
-Save Transcript via Prisma
+Map Scribe response → segments:
+  Group consecutive words by speaker into utterance segments
+  [{
+    speaker: "speaker_0",     // Scribe speaker label
+    text: utteranceText,      // concatenated words for this speaker turn
+    originalLang: detectLang(utteranceText),  // "en" | "my" | "my-en"
+    translatedText: null,     // filled in next step
+    start: firstWord.start * 1000,  // convert seconds → milliseconds
+    end: lastWord.end * 1000
+  }]
+      ↓
+Gemini: translateNonEnglishSegments(segments)
+  — for each segment where originalLang !== "en":
+      translate text to English → set translatedText
+  — batches of 10 to avoid rate limits
+  — on error: log, set translatedText: null, continue (never fail job)
+      ↓
+prisma.transcript.create({
+  meetingId,
+  rawText: segments.map(s => s.text).join(" "),
+  diarizedSegments: segments
+})
       ↓
 Status → "transcript_reviewing"
-      ↓
-Frontend polling detects "transcript_reviewing" → redirects to /meetings/:id/review (Step 1)
+Frontend polling detects → redirects to /meetings/:id/review (Step 1)
 ```
 
-**Job type: `"analyze"` — AI Intelligence only (queued by confirm-transcript endpoint)**
+**Zarla keyterms — defined as a constant in elevenlabs.js:**
+
+```js
+const ZARLA_KEYTERMS = [
+  "JARVIS",
+  "Bahozay",
+  "Cannopy",
+  "InFlow",
+  "InMinutes",
+  "InKnow",
+  "Inductiv",
+  "Argent Blue",
+  "Zarla",
+  "Cho Cho",
+  "LangGraph",
+  "Kafka",
+  "Debezium",
+  "ClickHouse",
+  // add more as the product evolves
+];
+```
+
+**Language detection heuristic — no external library:**
+
+```js
+function detectLang(text) {
+  const hasBurmese = /[\u1000-\u109F]/.test(text);
+  const hasLatin = /[a-zA-Z]{3,}/.test(text); // 3+ Latin chars = real English word
+  if (hasBurmese && hasLatin) return "my-en"; // intra-sentence mixed
+  if (hasBurmese) return "my";
+  return "en";
+}
+```
+
+---
+
+**Job type: `"analyze"` — AI Intelligence (queued by confirm-transcript)**
 
 ```
 Job received: { meetingId, title }
       ↓
 Status → "analyzing"
       ↓
-Read diarizedSegments from Transcript table (already has real speaker names)
+Read diarizedSegments from Transcript table
+  (has real speaker names + human corrections from HITL Step 1)
       ↓
-formatTranscript(segments) → "Real Name: ...\nReal Name: ..."
+buildEnglishTranscript(segments):
+  — for each segment: translatedText ?? text
+  — format: "Real Name: [English text]\nReal Name: [English text]"
+  — always English-only content for intelligence layer
       ↓
 Gemini API (parallel):
-  extractKeyPoints(formatted)   → string[]
-  extractActionItems(formatted) → [{task, owner, deadline}]
+  extractKeyPoints(englishTranscript)   → string[]
+  extractActionItems(englishTranscript) → [{task, owner, deadline}]
       ↓
-generateMinutes(formatted, keyPoints, actionItems, title) → string
-  — prompt explicitly excludes: Attendees, Minutes Prepared By, Date Prepared
+generateMinutes(englishTranscript, keyPoints, actionItems, title) → string
+  — prompt excludes: Attendees, Minutes Prepared By, Date Prepared
       ↓
-Save Output via Prisma (draft — not yet confirmed by human)
+prisma.output.create({ meetingId, keyPoints, actionItems, meetingMinutes })
       ↓
 Status → "reviewing"
-      ↓
-Frontend polling detects "reviewing" → redirects to /meetings/:id/review (Step 2)
+Frontend polling detects → redirects to /meetings/:id/review (Step 2)
 ```
+
+---
 
 **On any error (either job type):**
 
 ```
 Status → "failed", errorMsg = error.message
 ```
+
+**Graceful degradation — translation failure:**
+If Gemini translation fails for a batch, log the error and continue with
+`translatedText: null` for those segments. The HITL editor shows the original
+Burmese text and the user can correct it. Never fail the whole job.
 
 ---
 
@@ -472,11 +591,28 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
 // Note: gemini-2.5-flash is deprecated for new API users — use gemini-2.5-flash-lite
+// Gemini File API no longer needed — Scribe v2 handles transcription
 
 async function generate(prompt) {
   const result = await model.generateContent(prompt);
   return result.response.text();
 }
+```
+
+### Segment Translation Prompt
+
+Used in the `"process"` worker job to translate non-English segments to English
+before saving. Gemini translates Burmese and mixed segments so the intelligence
+layer always receives English-only content.
+
+```
+Translate the following meeting transcript segments to English.
+Each segment is on its own line in the format: [INDEX] text
+Return ONLY the translations in the same format: [INDEX] translated text
+No preamble. No explanation. Preserve speaker names if mentioned.
+
+Segments:
+{segments formatted as [0] text\n[1] text\n...}
 ```
 
 ### Key Points Extraction
@@ -550,24 +686,216 @@ function parseJSON(text) {
 
 ---
 
-## AssemblyAI Integration
+## ElevenLabs Scribe v2 Integration
+
+Single API call replacing the previous two-pass AssemblyAI + Gemini pipeline.
+Handles Burmese, English, and intra-sentence code-switching natively.
 
 ```js
-// Diarized segment shape returned from AssemblyAI
-{
-  speaker: "Speaker A",   // "Speaker " + utterance.speaker (A, B, C...)
-  text: "...",
-  start: 1234,            // milliseconds
-  end: 5678               // milliseconds
+// backend/src/lib/elevenlabs.js
+import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
+
+const client = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+
+const ZARLA_KEYTERMS = [
+  "JARVIS",
+  "Bahozay",
+  "Cannopy",
+  "InFlow",
+  "InMinutes",
+  "InKnow",
+  "Inductiv",
+  "Argent Blue",
+  "Zarla",
+  "Cho Cho",
+  "LangGraph",
+  "Kafka",
+  "Debezium",
+  "ClickHouse",
+];
+
+export async function transcribeAudio(audioBuffer, mimeType, speakersExpected) {
+  const blob = new Blob([audioBuffer], { type: mimeType });
+
+  const response = await client.speechToText.convert({
+    audio: blob,
+    model_id: "scribe_v2",
+    language_code: "mya", // Burmese primary + EN/MY mixing
+    diarize: true, // speaker diarization
+    timestamps_granularity: "word", // word-level timestamps
+    keyterms: ZARLA_KEYTERMS,
+    ...(speakersExpected ? { num_speakers: speakersExpected } : {}),
+    // omit num_speakers → auto-detect
+  });
+
+  return mapScribeResponse(response);
 }
 
-// Config used
-{
-  audio_url: presignedR2Url,
-  speaker_labels: true,
-  speakers_expected: 4    // reasonable default for business meetings
+function mapScribeResponse(response) {
+  // Group consecutive words by speaker into utterance segments
+  const segments = [];
+  let current = null;
+
+  for (const word of response.words) {
+    if (word.type === "spacing") continue;
+
+    if (!current || current.speaker !== word.speaker_id) {
+      if (current) segments.push(current);
+      current = {
+        speaker: word.speaker_id ?? "speaker_0",
+        text: word.text,
+        start: Math.round(word.start * 1000), // seconds → milliseconds
+        end: Math.round(word.end * 1000),
+      };
+    } else {
+      current.text += " " + word.text;
+      current.end = Math.round(word.end * 1000);
+    }
+  }
+  if (current) segments.push(current);
+
+  // Add language detection + translatedText placeholder
+  return segments.map((seg) => ({
+    ...seg,
+    originalLang: detectLang(seg.text),
+    translatedText: null, // filled by translation step in worker
+  }));
+}
+
+function detectLang(text) {
+  const hasBurmese = /[\u1000-\u109F]/.test(text);
+  const hasLatin = /[a-zA-Z]{3,}/.test(text);
+  if (hasBurmese && hasLatin) return "my-en";
+  if (hasBurmese) return "my";
+  return "en";
 }
 ```
+
+**Install:**
+
+```bash
+cd backend
+npm install @elevenlabs/elevenlabs-js
+```
+
+**What Scribe v2 returns (relevant fields):**
+
+```js
+{
+  text: "full transcript string",
+  words: [
+    {
+      text: "Let's",
+      type: "word",           // "word" | "spacing" | "audio_event"
+      start: 0.24,            // seconds (float)
+      end: 0.48,
+      speaker_id: "speaker_0" // null if diarize: false
+    },
+    ...
+  ]
+}
+```
+
+**Note on `language_code: "mya"`:** Setting Burmese as the primary language
+does not prevent English transcription — Scribe v2 handles multilingual audio
+natively. Setting `mya` tells Scribe to expect Burmese as dominant and improves
+accuracy on Burmese segments. English words within Burmese sentences are still
+transcribed correctly in Latin script.
+
+---
+
+## HITL Review — Upgraded UX (Sonix-Inspired)
+
+The review page implements four upgrades inspired by Sonix's editor experience.
+
+### Upgrade 1 — Persistent Audio Player (AudioPlayer.jsx)
+
+A fixed audio player bar at the top of the Step 1 review page.
+Audio is fetched via a presigned R2 download URL when the review page loads.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ▶  00:02:14 ──────────────────────────────── 45:32  [1×▼] │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- HTML `<audio>` element with custom controls (no browser default UI)
+- Playback position exposed via `currentTime` ref — used by TranscriptEditor
+  to highlight the active segment during playback
+- Speed control: 0.75×, 1×, 1.25×, 1.5×, 2×
+- Clicking a segment in TranscriptEditor seeks audio to that segment's start time
+- Player stays visible while scrolling (sticky top, z-index above content)
+
+### Upgrade 2 — Inline Speaker Rename on Transcript (SpeakerMapper integrated into TranscriptEditor)
+
+Speaker renaming happens directly on the speaker label in the transcript,
+not in a separate section above it.
+
+```
+┌─────────────────────────────────────────┐
+│ [SPEAKER A ▼]  00:00:12                 │  ← click label → dropdown appears
+│ Let's start with the Q3 numbers.        │
+└─────────────────────────────────────────┘
+```
+
+- Each unique speaker label is a clickable element
+- Clicking opens an inline dropdown with:
+  - Search input (debounced, searches employees then persons)
+  - Dropdown results from /api/people/employees and /api/people/persons
+  - "Use [typed name]" option if no match
+- Selecting a name renames ALL instances of that speaker label simultaneously
+- Speaker labels update visually everywhere in the transcript in real time
+- speakerMap state held in Review.jsx, passed down to TranscriptEditor
+
+### Upgrade 3 — Editable Transcript (TranscriptEditor.jsx)
+
+The transcript in Step 1 is fully editable. Replaces the read-only
+TranscriptView in the review context.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ [Aung Khant ▼]  [my]  00:00:28                             │
+│ ကောင်းပါပြီ၊ ဒီနှစ် budget က ဘယ်လောက်လဲ                    │  ← click to edit
+│ [EN] Okay, what is this year's budget?                      │  ← click to edit translation
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Each segment displays:**
+
+- Speaker label (clickable → rename dropdown per Upgrade 2)
+- Language badge: `[en]` or `[my]` — DM Mono, 9px, ink-4 (shown only when
+  segment language differs from previous segment or is non-English)
+- Timestamp: DM Mono, ink-4 (formatted as MM:SS)
+- Original text — click to edit inline (contenteditable div)
+- Translation row (only shown when translatedText is not null):
+  `[EN]` prefix in DM Mono ink-4, then editable translation text
+
+**Editing behaviour:**
+
+- Click any text → it becomes editable (contenteditable, no separate input)
+- Click away or press Escape → saves edit to local segment state
+- Segment state held in TranscriptEditor, synced up to Review.jsx on every change
+- Clicking timestamp seeks audio player to that segment's start time
+- Active segment (audio position falls within start/end) gets a subtle
+  left border highlight (2px, signal color) during playback
+
+**On confirm-transcript:**
+
+- Full edited diarizedSegments array sent in POST body
+- Backend saves edited segments to Transcript table
+- AI analysis (analyze job) uses translatedText for English content
+  — user corrections to translations are respected
+
+### Upgrade 4 — Always-Mixed Multilingual Pipeline
+
+No language selector on the upload form. Always configured as mixed.
+Scribe v2 always runs with `language_code: "mya"` — handles Burmese, English,
+and intra-sentence code-switching natively in a single API call.
+Translation step always runs in the worker for non-English segments.
+Gemini intelligence always receives English-only content via buildEnglishTranscript().
+
+The user-facing signal is the language badge on each segment in TranscriptEditor.
+No other UI changes required for multilingual support.
 
 ---
 
@@ -587,18 +915,19 @@ npx shadcn@latest init
 **Add components as needed:**
 
 ```bash
-npx shadcn@latest add button card badge tabs table
+npx shadcn@latest add button card badge tabs table input
 ```
 
 **Components used in this app and where:**
 
-| Component | Used in                                   |
-| --------- | ----------------------------------------- |
-| Button    | UploadZone, MinutesView, everywhere       |
-| Card      | MeetingList cards, Meeting page container |
-| Badge     | StatusBadge wrapper                       |
-| Tabs      | Meeting page output tabs                  |
-| Table     | ActionItemsTable                          |
+| Component | Used in                                            |
+| --------- | -------------------------------------------------- |
+| Button    | UploadZone, MinutesView, everywhere                |
+| Card      | MeetingList cards, Meeting page container          |
+| Badge     | StatusBadge wrapper, language badges in transcript |
+| Tabs      | Meeting page output tabs                           |
+| Table     | ActionItemsTable                                   |
+| Input     | Login, Register, SpeakerMapper search              |
 
 **Customization rule:** Modify shadcn components freely to match the design
 system. They are in your codebase — treat them as your own files.
@@ -621,10 +950,10 @@ Follow this exactly. No deviations.
 />
 ```
 
-| Font    | Role | Usage                                               |
-| ------- | ---- | --------------------------------------------------- |
-| Inter   | Body | ALL UI text, headings, labels, buttons, body copy   |
-| DM Mono | Mono | Timestamps, status badges, speaker labels, metadata |
+| Font    | Role | Usage                                                                |
+| ------- | ---- | -------------------------------------------------------------------- |
+| Inter   | Body | ALL UI text, headings, labels, buttons, body copy                    |
+| DM Mono | Mono | Timestamps, status badges, speaker labels, metadata, language badges |
 
 **Rules — no exceptions:**
 
@@ -632,7 +961,7 @@ Follow this exactly. No deviations.
 - Inter `weight 400` → default UI text
 - Inter `weight 500` → section labels, card titles
 - Inter `weight 600` → page headings, primary actions only
-- DM Mono → ALL metadata, timestamps, speaker labels, status badges
+- DM Mono → ALL metadata, timestamps, speaker labels, status badges, language badges ([en], [my])
 - NEVER use system-ui, Roboto, or any unlisted font
 
 ### CSS Variables
@@ -781,10 +1110,13 @@ const STATUS_CONFIG = {
     className: "font-mono bg-signal-light text-signal border-signal/20",
     style: { animation: "progressPulse 2s ease infinite" },
   },
+  transcript_reviewing: {
+    label: "Awaiting Transcript Review",
+    className: "font-mono bg-warning-light text-warning border-warning/20",
+  },
   reviewing: {
     label: "Awaiting Review",
     className: "font-mono bg-warning-light text-warning border-warning/20",
-    style: { animation: "progressPulse 2s ease infinite" },
   },
   done: {
     label: "Done",
@@ -801,7 +1133,16 @@ const STATUS_CONFIG = {
 };
 ```
 
-**Speaker label (TranscriptView):**
+**Language badge (TranscriptEditor segments):**
+
+```jsx
+// Shown per segment when originalLang is not "en" or when language changes
+<span className="font-mono text-[8px] tracking-[0.12em] uppercase text-ink-4 bg-ground px-1 py-0.5 border border-rule">
+  my
+</span>
+```
+
+**Speaker label (TranscriptView — read-only Meeting page):**
 
 ```jsx
 <span className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4">
@@ -847,12 +1188,13 @@ Do not move to the next step until the current one is complete and working.
 □ Add fonts to frontend/index.html
 □ Paste CSS variables and keyframes into frontend/src/index.css
 □ Initialize shadcn/ui: npx shadcn@latest init
-□ Add shadcn components: button card badge tabs table
+□ Add shadcn components: button card badge tabs table input
 □ Initialize Express in backend/
 □ Install backend dependencies:
     express cors dotenv bullmq ioredis uuid
     @prisma/client prisma
-    @google/generative-ai assemblyai
+    @google/generative-ai
+    @elevenlabs/elevenlabs-js
     @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
 □ Install dev dependencies:
     nodemon (backend)
@@ -871,8 +1213,8 @@ classes apply. Fonts load. shadcn Button renders correctly.
 □ Create backend/prisma/schema.prisma with the schema above
 □ Run: npx prisma migrate dev --name init
 □ Run: npx prisma generate
-□ Verify all 3 tables exist in Railway Postgres dashboard
-□ Create Cloudflare R2 bucket: meeting-intel
+□ Verify all tables exist in Railway Postgres dashboard
+□ Create Cloudflare R2 bucket: in-minutes
 □ Set R2 CORS policy:
     AllowedOrigins: [http://localhost:5173, Vercel production domain]
     AllowedMethods: [PUT]
@@ -893,19 +1235,23 @@ R2 bucket exists with CORS configured. `prisma.meeting.count()` returns 0.
 ```
 □ POST /api/upload/presign
     — validate: filename, contentType, title required
-    — prisma.meeting.create({ title, audioKey, status: "uploading" })
+    — prisma.meeting.create({
+        title, audioKey,
+        audioContentType: contentType,   // store original MIME type
+        status: "uploading"
+      })
     — getUploadUrl(audioKey, contentType) → presigned R2 URL
     — return { meetingId, uploadUrl, audioKey }
 
 □ POST /api/upload/confirm/:id
     — prisma.meeting.update({ status: "transcribing" })
-    — meetingQueue.add("process", { meetingId, audioKey, title })
+    — meetingQueue.add("process", { meetingId, audioKey })
     — return { status: "queued" }
 
 □ Worker scaffold (backend/src/worker/index.js)
     — connects to BullMQ queue
     — logs job received: { meetingId }
-    — prisma.meeting.update({ status: "done" }) — stub only, no real processing
+    — prisma.meeting.update({ status: "transcript_reviewing" }) — stub only
     — this stub is replaced entirely in Build Order 04
 
 □ GET /api/meetings
@@ -918,6 +1264,7 @@ R2 bucket exists with CORS configured. `prisma.meeting.count()` returns 0.
     — drag and drop OR click to pick file
     — accepted: .mp4 .webm .mp3 .wav .m4a (max 500MB, validate client-side)
     — title input field
+    — NO language selector — always mixed multilingual mode
     — upload progress bar (XMLHttpRequest for progress events)
     — on complete: call confirm → navigate to /meetings/:id
 □ MeetingList.jsx:
@@ -932,54 +1279,86 @@ R2 bucket exists with CORS configured. `prisma.meeting.count()` returns 0.
 ```
 
 **Definition of done:** Upload a real audio file through the UI. File
-appears in R2 bucket. Meeting row in Postgres with status "done" (stub).
-Meeting appears in the list. Clicking it navigates to /meetings/:id.
+appears in R2 bucket. Meeting row in Postgres with status "transcript_reviewing"
+(stub). Meeting appears in the list. Clicking it navigates to /meetings/:id.
 
 ---
 
-### 04 — Worker: Transcription + Intelligence
+### 04 — Worker: Transcription + Intelligence (Scribe v2)
 
 ```
-□ backend/src/lib/assemblyai.js
-    — AssemblyAI SDK client
-    — transcribeWithDiarization(audioUrl):
-        config: { audio_url, speaker_labels: true, speakers_expected: 4 }
-        polls until transcript.status === "completed"
-        maps utterances → [{ speaker: "Speaker " + u.speaker, text, start, end }]
-        returns { rawText: transcript.text, segments }
+□ Install ElevenLabs SDK in backend:
+    npm install @elevenlabs/elevenlabs-js
 
-□ backend/src/lib/intelligence.js
-    — Gemini client: gemini-2.5-flash
-    — generate(prompt) helper with JSON fence stripping (parseJSON)
-    — formatTranscript(segments) → "Speaker A: ...\nSpeaker B: ..."
-    — extractKeyPoints(transcript) → string[]     (parallel in worker)
-    — extractActionItems(transcript) → [{task, owner, deadline}]  (parallel)
-    — generateMinutes(transcript, keyPoints, actionItems, title) → string
-    — use prompts exactly as defined in the AI Prompts section above
+□ backend/src/lib/elevenlabs.js
+    — ElevenLabsClient with ELEVENLABS_API_KEY
+    — ZARLA_KEYTERMS constant (product/company names)
+    — transcribeAudio(audioBuffer, mimeType, speakersExpected):
+        calls client.speechToText.convert with:
+          model_id: "scribe_v2"
+          language_code: "mya"
+          diarize: true
+          timestamps_granularity: "word"
+          keyterms: ZARLA_KEYTERMS
+          num_speakers: speakersExpected (omit if null)
+        maps words array → utterance segments
+        returns [{speaker, text, originalLang, translatedText: null, start, end}]
+    — detectLang(text) → "en" | "my" | "my-en" (Unicode heuristic)
+    — mapScribeResponse(response) → segments array
 
-□ Worker — replace stub with full pipeline:
-    — prisma.meeting.update({ status: "transcribing" })
-    — getDownloadUrl(audioKey)
-    — transcribeWithDiarization(url) → { rawText, segments }
-    — prisma.transcript.create({ meetingId, rawText, diarizedSegments: segments })
-    — prisma.meeting.update({ status: "analyzing" })
-    — formatTranscript(segments)
+□ backend/src/lib/intelligence.js — add these functions:
+    — translateNonEnglishSegments(segments):
+        filters where originalLang !== "en"
+        batches of 10 → Gemini segment translation prompt
+        sets translatedText per segment
+        on error: logs, keeps translatedText: null, continues
+        returns updated segments
+    — buildEnglishTranscript(segments):
+        for each segment: translatedText ?? text
+        format: "speaker: [English text]\n"
+        returns English-only string
+    — formatTranscript already handles real names after HITL Step 1
+
+□ Worker — job type "process" (Scribe v2 single-pass):
+    — status → "transcribing"
+    — getDownloadUrl(audioKey) → presigned R2 URL
+    — download audio from R2 → buffer
+        (use node-fetch: const res = await fetch(url); buffer = await res.buffer())
+    — transcribeAudio(buffer, audioContentType, speakersExpected) → segments
+    — translateNonEnglishSegments(segments) → segments with translatedText
+    — prisma.transcript.create({
+        meetingId,
+        rawText: segments.map(s => s.text).join(" "),
+        diarizedSegments: segments
+      })
+    — status → "transcript_reviewing"
+
+□ Worker — job type "analyze" (triggered by confirm-transcript):
+    — read diarizedSegments from Transcript table
+      (has real speaker names + human corrections from HITL Step 1)
+    — buildEnglishTranscript(segments) → English-only string
     — Promise.all([extractKeyPoints, extractActionItems])
     — generateMinutes(...)
     — prisma.output.create({ meetingId, keyPoints, actionItems, meetingMinutes })
-    — prisma.meeting.update({ status: "reviewing" })
-    — catch: prisma.meeting.update({ status: "failed", errorMsg: error.message })
+    — status → "reviewing"
+
+□ Worker dispatches on job.name:
+    "process"  → Scribe v2 transcription pipeline
+    "analyze"  → Gemini intelligence pipeline
 
 □ GET /api/meetings/:id/transcript
-    — prisma.transcript.findUnique({ where: { meetingId: id } })
 □ GET /api/meetings/:id/output
-    — prisma.output.findUnique({ where: { meetingId: id } })
 ```
 
-**Definition of done:** Upload a real meeting recording (a 2-minute test
-call is fine). Worker logs each step. Prisma has Transcript + Output rows.
-Meeting status is "done". Verify key points, action items, and minutes
-look correct by reading directly from the database.
+**Definition of done:**
+
+- Upload a real meeting recording with Burmese + English speech
+- Worker logs: download → Scribe v2 → segments mapped → translation → saved
+- Transcript table has diarizedSegments with correct Burmese Myanmar script
+- Burmese segments: `originalLang: "my"` or `"my-en"`, `translatedText` in English
+- English segments: `originalLang: "en"`, `translatedText: null`
+- Status is `"transcript_reviewing"`
+- Burmese text appears as Myanmar script — NOT Japanese/Vietnamese/Chinese characters
 
 ---
 
@@ -991,18 +1370,20 @@ the transcript in Step 1, which triggers AI analysis. Once analysis completes
 (status `reviewing`), the user is redirected back for Step 2 to review output.
 
 ```
-✓ API routes in backend/src/routes/meetings.js:
+□ API routes in backend/src/routes/meetings.js:
 
     POST /api/meetings/:id/review/confirm-transcript
-        — body: { speakerMap }
-        — applies speakerMap to diarizedSegments in Transcript table
-        — queues BullMQ "analyze" job → status "analyzing"
+        — body: { speakerMap, diarizedSegments }
+        — applies speakerMap to segment speaker labels in provided diarizedSegments
+        — saves updated diarizedSegments to Transcript table
+        — queues BullMQ job.name "analyze" → status "analyzing"
         — return { status: "analyzing" }
 
     POST /api/meetings/:id/review/confirm
         — body: { speakerMap, meetingMinutes, actionItems,
                   attendees, minutesPreparedBy, datePrepared }
-        — saves attendees to Meeting.attendees (creates Person records for manual entries)
+        — saves attendees to Meeting.attendees
+          (creates Person records for entries where personId is null)
         — saves minutesPreparedBy + datePrepared to Output
         — creates MeetingParticipant rows + Person records per speaker
         — status → "done", completedAt set
@@ -1012,66 +1393,128 @@ the transcript in Step 1, which triggers AI analysis. Once analysis completes
         — status → "discarded"
         — return { status: "discarded" }
 
-✓ Review.jsx — the HITL review shell
-    — Fetches meeting on mount, branches on status:
+□ GET /api/meetings/:id/audio-url
+    — getDownloadUrl(meeting.audioKey) → presigned R2 URL
+    — expires in 2 hours (long enough for review session)
+    — return { url, contentType: meeting.audioContentType ?? "audio/mpeg" }
+    — contentType used by AudioPlayer to set correct <source type> attribute
+    — fallback "audio/mpeg" covers legacy meetings without stored contentType
+
+□ Review.jsx — the HITL review shell
+    — Fetches meeting + audio URL on mount
+    — Branches on status:
         transcript_reviewing → renders StepTranscript
+        analyzing            → renders processing state (polling continues)
         reviewing            → renders StepOutput
     — Redirects to /meetings/:id if status is "done"
-    — Redirects to / if status is anything else
+    — Redirects to / if status is "discarded" or "failed"
 
-✓ StepTranscript (Step 1 of 2) — Transcript Review
+□ AudioPlayer.jsx
+    — Props: audioUrl, contentType, onTimeUpdate (fires with currentTime every 250ms)
+    — HTML <audio> element, no browser default controls (controls={false})
+    — Source element uses contentType prop directly:
+        <audio ref={audioRef} preload="metadata">
+          <source src={audioUrl} type={contentType} />
+        </audio>
+    — contentType matches whatever was uploaded:
+        MP4  → "video/mp4"   (browser plays audio track, video track ignored)
+        MP3  → "audio/mpeg"
+        WAV  → "audio/wav"
+        M4A  → "audio/mp4"
+        WebM → "video/webm"
+    — No conversion, no transcoding — browser handles all formats natively
+    — Custom control bar:
+        play/pause button (▶/⏸)
+        current time display (MM:SS — DM Mono)
+        progress bar (click to seek)
+        duration display (MM:SS — DM Mono)
+        speed selector (0.75× 1× 1.25× 1.5× 2×)
+    — Exposes seekTo(seconds) via ref for TranscriptEditor to call
+    — Sticky top of Step 1 page, z-index above content
+
+□ TranscriptEditor.jsx
+    — Props: segments, speakerMap, audioCurrentTime, onSegmentsChange,
+             onSpeakerMapChange, onSeek (calls AudioPlayer.seekTo)
+    — Renders each segment as an editable block:
+
+        Segment block layout:
+        ┌─────────────────────────────────────────────────────────┐
+        │ [Speaker Name ▼]  [my]  00:02:14                       │
+        │ ကောင်းပါပြီ၊ ဒီနှစ် budget က ဘယ်လောက်လဲ                │
+        │ [EN] Okay, what is this year's budget?                  │
+        └─────────────────────────────────────────────────────────┘
+
+        Speaker label: clickable, opens inline rename dropdown
+          — Dropdown: search input (debounced 300ms)
+          — Searches /api/people/employees then /api/people/persons
+          — "Use [typed name]" option at bottom
+          — Selecting a name updates ALL segments with that speaker label
+          — Updates speakerMap state in parent
+        Language badge: shown only when originalLang !== "en"
+          — DM Mono, 8px, ink-4, bg-ground, border-rule
+        Timestamp: DM Mono, ink-4
+          — Clicking seeks AudioPlayer to segment.start / 1000
+        Original text: contenteditable div
+          — Click to edit, click away or Escape to save
+          — Updates segment.text in local state
+        Translation row: shown only when translatedText is not null
+          — "[EN]" prefix (DM Mono, ink-4) + editable translation text
+          — Click to edit translation, click away to save
+          — Updates segment.translatedText in local state
+        Active segment highlight: when audioCurrentTime falls within
+          segment.start/1000 and segment.end/1000:
+          left border: 2px solid signal color
+          background: signal-light at 30% opacity
+
+    — Calls onSegmentsChange on every edit (debounced 500ms)
+    — Calls onSpeakerMapChange when speaker label is renamed
+
+□ StepTranscript (Step 1 of 2) — Transcript Review
     — Header: "STEP 1 OF 2 — Review Transcript"
-    — Section 1: Speakers Detected
-        — SpeakerMapper.jsx with autocomplete search
-        — Each speaker row searches employees → persons as user types
-        — Picks from dropdown or types manually if no match found
-        — Blank = speaker label kept as-is
-    — Section 2: Transcript (expanded by default)
-        — Full diarized transcript, scrollable (max-height 480px)
-        — Collapse/expand toggle
-    — Bottom bar:
-        Left: "Discard" → POST /discard → navigate to /
-        Right: "Confirm Transcript →" → POST /confirm-transcript → navigate to /meetings/:id
-               (Meeting.jsx polls: analyzing → reviewing → back to /review for Step 2)
+    — Sub-header: "Rename speakers, correct the transcript, then confirm."
+    — AudioPlayer.jsx (sticky top)
+    — Section: "Transcript" — TranscriptEditor.jsx (full, no collapse)
+    — Bottom bar (sticky):
+        Left: "Discard" (secondary button)
+        Right: "Confirm Transcript →" (primary button)
+    — On Confirm:
+        POST /confirm-transcript with { speakerMap, diarizedSegments }
+        Navigate to /meetings/:id
+        Meeting.jsx polls: analyzing → reviewing → redirects back to /review
+          for Step 2
 
-✓ StepOutput (Step 2 of 2) — Output Review
+□ StepOutput (Step 2 of 2) — Output Review
     — Header: "STEP 2 OF 2 — Review Minutes & Action Items"
-    — Section 1: Attendees
-        — AttendeeList.jsx component
-        — Pre-populated with renamed speaker names from Step 1
-        — User can add more attendees or remove any
-        — Search: employees first → persons → manual entry auto-creates Person on confirm
+    — Section 1: Attendees (AttendeeList.jsx)
+        Pre-populated with renamed speaker names from Step 1
     — Section 2: Meeting Minutes
-        — Editable textarea, auto-grows, min-height 200px
-        — Footer below textarea (below a border-t):
-            "Minutes Prepared By" input — default: logged-in employee name
-            "Date Prepared" input — default: today's date (human-readable string)
+        Editable textarea, auto-grows, min-height 200px
+        Footer below textarea (border-t):
+          "Minutes Prepared By" input — default: logged-in employee name
+          "Date Prepared" input — default: today's date
     — Section 3: Action Items — inline editable table (Task | Owner | Deadline)
     — Section 4: Key Points — read-only bulleted list
-    — Bottom bar:
-        Left: "Discard" → POST /discard → navigate to /
-        Right: "Confirm & Save" → POST /confirm → navigate to /meetings/:id
+    — Bottom bar (sticky):
+        Left: "Discard"
+        Right: "Confirm & Save"
 
-✓ SpeakerMapper.jsx
-    — One row per unique speaker label derived from diarizedSegments
-    — Each row: DM Mono speaker label + SpeakerInput (autocomplete)
-    — SpeakerInput: debounced search (300ms) → employees → persons dropdown
-    — No match found → typed text is used as manual name
-    — Exposes speakerMap via onChange prop
+□ SpeakerMapper.jsx
+    — Used inside TranscriptEditor for inline speaker rename
+    — Standalone version no longer needed as a separate section
+    — Exposes: speakerMap via onSpeakerMapChange
 
-✓ AttendeeList.jsx
+□ AttendeeList.jsx
     — Props: attendees [{personId, name}], onChange
-    — Debounced search (300ms) across /api/people/employees then /api/people/persons
-    — Employees shown first; persons already linked to employees are deduplicated
-    — No results → "Add [name]" option → {personId: null, name}
-    — On confirm, null personId entries create new Person records in DB
+    — Debounced search (300ms): /api/people/employees → /api/people/persons
+    — "Add [name]" for no-match manual entries
+    — Remove button per attendee
 ```
 
-**Definition of done:** After upload + transcription, user lands on Step 1 to
-rename speakers and review transcript. After confirming transcript, AI analysis
-runs and user is returned to Step 2 to review minutes/action items/key points.
-Attendees pre-filled from speaker names. Confirm saves all structured metadata
-and sets status "done". Discard sets "discarded".
+**Definition of done:** Step 1 loads audio player + editable transcript with
+language badges. Speaker rename works inline. Text edits save to segment state.
+Translation edits save. Confirm-transcript sends edited segments + speakerMap.
+Worker analyze job runs. Step 2 loads with pre-populated attendees. Minutes
+and action items editable. Confirm saves all and sets "done".
 
 ---
 
@@ -1088,10 +1531,7 @@ Build this after Step 05 (Review Page) is complete and working.
     npm install bcryptjs jsonwebtoken
 
 □ Prisma schema migration:
-    — Add Employee model (as defined in schema above)
-    — Add Person model (as defined in schema above)
-    — Add MeetingParticipant model (as defined in schema above)
-    — Add employeeId field to Meeting model
+    — Employee, Person, MeetingParticipant models already in schema above
     — Run: npx prisma migrate dev --name add-auth-and-persons
     — Run: npx prisma generate
 
@@ -1103,115 +1543,70 @@ Build this after Step 05 (Review Page) is complete and working.
         — bcrypt.hash(password, 10) → passwordHash
         — prisma.person.create({ canonicalName: name, email })
         — prisma.employee.create({ name, email, passwordHash, jobTitle, personId })
-        — sign JWT: { employeeId, email, role } with JWT_SECRET, expiresIn: "7d"
+        — sign JWT: { employeeId, email, role } — JWT_SECRET, expiresIn: "7d"
         — return { token, employee: { id, name, email, role } }
 
     POST /api/auth/login
         — find employee by email
         — bcrypt.compare(password, passwordHash)
         — if mismatch → 401 "Invalid email or password"
-        — sign JWT same as above
-        — return { token, employee: { id, name, email, role } }
+        — sign JWT, return { token, employee: { id, name, email, role } }
 
     GET /api/auth/me
         — requires auth middleware
-        — prisma.employee.findUnique({ where: { id: req.employee.id } })
         — return { employee: { id, name, email, role, jobTitle } }
 
 □ backend/src/middleware/auth.js:
-    — read Authorization header: "Bearer <token>"
-    — jwt.verify(token, JWT_SECRET) → decoded payload
-    — attach decoded employee to req.employee
-    — if missing or invalid → 401 "Authentication required"
-    — export as middleware function
+    — read Authorization: Bearer <token>
+    — jwt.verify(token, JWT_SECRET) → decoded
+    — attach to req.employee
+    — missing/invalid → 401
 
 □ Protect all existing routes:
-    — import auth middleware in backend/src/index.js
-    — apply to all /api/meetings/* and /api/upload/* routes
+    — all /api/meetings/* and /api/upload/* require auth
     — /api/auth/register and /api/auth/login stay public
 
+□ backend/src/routes/people.js:
+    GET /api/people/employees?q=
+        — prisma.employee.findMany where name contains q (case-insensitive)
+        — return [{id, name, jobTitle, personId}] max 8
+    GET /api/people/persons?q=
+        — prisma.person.findMany where canonicalName contains q
+        — return [{id, canonicalName, jobTitle, email}] max 8
+
 □ Update POST /api/upload/presign:
-    — extract employeeId from req.employee.id
-    — prisma.meeting.create({ ..., employeeId })
+    — prisma.meeting.create({ ..., employeeId: req.employee.id })
 
 □ Update GET /api/meetings:
-    — if req.employee.role === "admin" → return all meetings
-    — else → filter by employeeId: req.employee.id
-
-□ Update POST /api/meetings/:id/review/confirm:
-    — after saving output, create MeetingParticipant rows:
-        for each entry in speakerMap ({ "Speaker A": "Real Name" }):
-          — fuzzy search Person registry for "Real Name"
-          — if match found (exact or close) → use existing personId
-          — if no match → prisma.person.create({ canonicalName: "Real Name" })
-                          add "Real Name" to aliases if variant detected
-          — prisma.meetingParticipant.create({
-              meetingId, personId, speakerLabel: "Speaker A"
-            })
-
-□ Add shadcn input component:
-    npx shadcn@latest add input
+    — admin: return all
+    — member: filter by employeeId
 
 □ frontend/src/lib/api.js:
-    — add Authorization header to all requests:
-        const token = localStorage.getItem("token")
-        if (token) headers["Authorization"] = `Bearer ${token}`
-    — add auth API functions:
-        register(name, email, password, jobTitle)
-        login(email, password)
-        getMe()
+    — add Authorization header: Bearer token from localStorage
+    — add: register, login, getMe, searchEmployees, searchPersons
+    — getAudioUrl(meetingId) → { url, contentType }
+      used by Review.jsx to pass both to AudioPlayer
 
 □ frontend/src/hooks/useAuth.js:
-    — stores { employee, token } in useState
-    — on mount: read token from localStorage → call getMe() to verify
-    — login(email, password): calls api.login → stores token → sets employee
-    — logout(): clears localStorage token → clears employee state
-    — exposes: { employee, loading, login, logout, isAdmin }
+    — { employee, loading, login, logout }
+    — on mount: read token → call getMe() to verify
+    — logout: clears token, clears state
 
-□ frontend/src/pages/Login.jsx:
-    — centered card, max-width 400px
-    — "InMinutes" wordmark at top (Inter weight 600, 20px)
-    — Email input + Password input
-    — "Sign in" primary button
-    — "Don't have an account? Register" link → /register
-    — On success → navigate to /
-    — Error: "Invalid email or password." inline below button
-
-□ frontend/src/pages/Register.jsx:
-    — same card layout as Login
-    — Name + Email + Password + Job Title (optional) inputs
-    — "Create account" primary button
-    — "Already have an account? Sign in" link → /login
-    — On success → navigate to /
-    — Error: "An account with this email already exists." inline
+□ frontend/src/pages/Login.jsx + Register.jsx:
+    — standard auth forms, centered card max-width 400px
+    — "InMinutes" wordmark at top
 
 □ frontend/src/App.jsx — protected routes:
-    — wrap all routes except /login and /register with auth check
-    — if no valid token → redirect to /login
-    — if valid token → render the route
-    — Route: /login → Login.jsx (public)
-    — Route: /register → Register.jsx (public)
-    — Route: / → Home.jsx (protected)
-    — Route: /meetings/:id → Meeting.jsx (protected)
-    — Route: /meetings/:id/review → Review.jsx (protected)
+    — /login, /register: public
+    — all other routes: redirect to /login if no valid token
 
-□ Seed first admin account manually:
-    — Register via the UI with your email
-    — Run in Railway Postgres or local psql:
-      UPDATE "Employee" SET role = 'admin' WHERE email = 'your@email.com';
-    — Document this in README
+□ Seed first admin:
+    UPDATE "Employee" SET role = 'admin' WHERE email = 'your@email.com';
 ```
 
-**Definition of done:**
-
-- Unauthenticated requests to /api/meetings return 401
-- Can register a new account → person record auto-created in DB
-- Can log in → JWT returned and stored
-- Uploading a meeting links it to the logged-in employee
-- Meeting list shows only the current user's meetings (admin sees all)
-- Confirm flow creates MeetingParticipant rows and Person records
-- Refreshing the page keeps the user logged in (token persisted)
-- Logging out clears the session and redirects to /login
+**Definition of done:** Unauthenticated requests return 401. Register creates
+Employee + Person. Login returns JWT. Meetings scoped by employee. People search
+endpoints return results. Auth persists across page refresh.
 
 ---
 
@@ -1220,22 +1615,21 @@ Build this after Step 05 (Review Page) is complete and working.
 ```
 □ Meeting.jsx — status polling + read-only tabbed output
     — on mount: fetch GET /api/meetings/:id
-    — poll every 5 seconds while status is not "done", "failed", or "discarded"
-    — if status hits "reviewing" → redirect to /meetings/:id/review immediately
-    — stop polling when terminal status reached (done / failed / discarded)
+    — poll every 5 seconds while status not terminal
+    — terminal: done | failed | discarded
+    — if status is "transcript_reviewing" or "reviewing" → redirect to /review
     — when "done": fetch transcript + output in parallel, render tabs
 
-    Processing state (pending / uploading / transcribing / analyzing):
-    — StatusBadge with current status
-    — processing message matching status:
-        transcribing → "Transcribing audio with speaker detection..."
-        analyzing    → "Analyzing with AI..."
-    — progressPulse animation on the status badge
+    Processing states and messages:
+        uploading            → "Uploading recording..."
+        transcribing         → "Transcribing audio with speaker detection..."
+        transcript_reviewing → redirect to /review (Step 1)
+        analyzing            → "Analyzing with AI..."
+        reviewing            → redirect to /review (Step 2)
 
     Done state — shadcn Tabs (4 tabs, all read-only):
     — Minutes (default) · Action Items · Key Points · Transcript
-    — fadeIn animation on tab content switch
-    — no editing on this page — output is final and confirmed
+    — No editing on this page — output is final
 
     Discarded state:
     — StatusBadge "Discarded"
@@ -1243,36 +1637,31 @@ Build this after Step 05 (Review Page) is complete and working.
     — Link: "Upload a new recording →"
 
 □ MinutesView.jsx
-    — render meetingMinutes as plain preformatted text
-    — shadcn Button "Copy" → navigator.clipboard.writeText
-    — shadcn Button "Export .md" → Blob download
-    — both use secondary (outline) button variant
+    — Attendees section at top (above minutes text):
+        renders Meeting.attendees as a comma-separated list
+        "Attendees: Name 1, Name 2, Name 3"
+    — Minutes Prepared By + Date Prepared below attendees:
+        "Prepared by [minutesPreparedBy] · [datePrepared]"
+        DM Mono, ink-4, 11px
+    — meetingMinutes rendered as plain preformatted text
+    — "Copy" button → copies full output including attendees + metadata
+    — "Export .md" button → Blob download with attendees + metadata prepended
 
-□ ActionItemsTable.jsx
-    — shadcn Table: Task | Owner | Deadline columns
-    — DM Mono for Owner + Deadline cells
-    — "Not specified" in text-ink-4 when deadline is null
-    — empty state: "No action items detected in this meeting."
+□ ActionItemsTable.jsx — read-only on this page
+□ TranscriptView.jsx — read-only, shows diarizedSegments
+    — For non-English segments: show original text + translation below
+    — Language badge per segment when originalLang !== "en"
+□ Key Points tab — read-only bulleted list
 
-□ TranscriptView.jsx
-    — render diarizedSegments array
-    — each segment: DM Mono speaker label + Inter weight 300 text
-    — group consecutive same-speaker segments visually
-    — scrollable container, max-height with overflow-y-auto
-
-□ Key Points tab
-    — bulleted list from keyPoints array
-    — Inter weight 400, relaxed line-height
-
-□ Failed state
-    — StatusBadge "Failed"
+□ Failed state:
     — "This meeting could not be processed."
-    — show errorMsg if present (human-readable only — never raw stack traces)
+    — show errorMsg if present
 ```
 
-**Definition of done:** Full flow works in browser. Upload → real-time
-status → all four tabs render. Copy and export work. Failed state shows
-correct error message.
+**Definition of done:** Done meetings show all four tabs with correct data.
+Minutes tab shows attendees and prepared-by metadata. Transcript tab shows
+language badges and translations for non-English segments. Copy and export
+include full metadata.
 
 ---
 
@@ -1282,32 +1671,35 @@ Every screen must have all three. No exceptions.
 
 ```
 □ LOADING — skeleton screens using skeletonPulse, never spinners
-    — Home MeetingList: 3 skeleton cards (same card dimensions, bg-ground pulse)
+    — Home MeetingList: 3 skeleton cards
     — Meeting processing: StatusBadge + animated message
-    — Meeting output tabs: skeleton lines matching output structure
-    — Review page loading: skeleton for each section (SpeakerMapper, textarea, table)
+    — Meeting output tabs: skeleton lines
+    — Review Step 1: skeleton for AudioPlayer + transcript segments
+    — Review Step 2: skeleton for attendees list + textarea + table
 
 □ ERROR — human language + recovery action
     — Upload failure: "Upload failed. Check your connection and try again."
     — Processing failed: "This meeting could not be processed."
+    — Alignment failure: worker continues with "Unknown" speaker — never fails job
+    — Translation failure: worker continues with translatedText: null — never fails job
+    — Gemini file upload failure: status → "failed", errorMsg shown to user
     — Review confirm failure: "Could not save your changes. Try again."
-    — API errors: "Something went wrong — try again." + retry button
-    — Never show raw error messages or stack traces to users
+    — Never show raw errors or stack traces
 
 □ EMPTY — actionable, never blank
-    — Home no meetings: "No meetings yet. Upload your first recording above."
-    — ActionItemsTable no items: "No action items detected in this meeting."
-    — Key points no data: "No key points were extracted."
-    — Transcript no segments: "Transcript is not available."
-    — Review page action items empty: show one blank row with "+ Add row"
+    — Home: "No meetings yet. Upload your first recording above."
+    — ActionItemsTable: "No action items detected in this meeting."
+    — Key points: "No key points were extracted."
+    — Transcript: "Transcript is not available."
+    — Attendees in MinutesView: "No attendees recorded." (not blank)
 
-□ File validation (UploadZone, inline errors):
+□ File validation (UploadZone):
     — Wrong format: "Unsupported format. Use MP4, WebM, MP3, WAV, or M4A."
     — Too large: "File too large. Maximum size is 500MB."
 ```
 
-**Definition of done:** Every screen manually tested in loading, error,
-and empty states. No blank screens. No raw error messages visible.
+**Definition of done:** Every screen tested in all three states.
+Translation failures degrade gracefully — meeting still processes.
 
 ---
 
@@ -1317,44 +1709,37 @@ Do this after all features are working. Not while building features.
 
 ```
 □ Animations audit
-    — MeetingList cards: fadeIn staggered 40ms per card on load
-    — Tab content: fadeIn 200ms on every tab switch
+    — MeetingList cards: fadeIn staggered 40ms per card
+    — Tab content: fadeIn 200ms on tab switch
     — Status badge: progressPulse on transcribing/analyzing
-    — Upload progress: smooth fill, no jumping
+    — Active segment in TranscriptEditor: smooth border transition (150ms)
     — Hover transitions: 150ms on all interactive elements
 
-□ Typography audit — every screen
-    — headings: Inter weight 600
-    — body text: Inter weight 400
-    — metadata + badges + speaker labels: DM Mono
-    — no rogue font weights or system font fallbacks rendering
+□ Typography audit
+    — headings: Inter 600
+    — body: Inter 400
+    — metadata + badges + language badges + speaker labels: DM Mono
 
 □ Color audit
-    — no hardcoded hex values — CSS variables or Tailwind tokens only
-    — signal: processing states only
-    — success: done badge only
-    — danger: failed badge + error states only
+    — no hardcoded hex — CSS variables or Tailwind tokens only
 
 □ shadcn override audit
-    — all shadcn components match design system (font, border-radius, color)
-    — no default shadcn blue/purple colors leaking through
     — Card: rounded-none, border-rule
+    — no default shadcn blue/purple leaking through
 
 □ Copy audit
-    "Loading..."        → skeleton screen
-    "Error occurred"    → "Something went wrong — try again."
-    "Submit"            → Upload / Copy / Export (specific verb)
-    "No results found"  → specific empty state message
+    — no placeholder copy anywhere
+    — all empty states are specific and actionable
 
 □ Responsive check
-    — Home page works at 768px minimum
-    — Meeting tabs scroll correctly on narrow screens
-    — Upload zone works on touch
+    — Home: 768px minimum
+    — Review page: TranscriptEditor readable at 768px
+    — Audio player controls usable on touch
+    — Meeting tabs scroll correctly at narrow widths
 ```
 
-**Definition of done:** App looks intentional at every breakpoint. No
-animation jank. No placeholder copy. shadcn components fully match the
-design system.
+**Definition of done:** No animation jank. No rogue fonts. No hardcoded colors.
+Audio player usable on touch. TranscriptEditor segments readable at 768px.
 
 ---
 
@@ -1380,31 +1765,31 @@ design system.
 ✓ User can upload a meeting recording (MP4, WebM, MP3, WAV, M4A — max 500MB)
 ✓ File uploads directly to Cloudflare R2 via presigned URL
 ✓ Background worker processes the recording automatically
-✓ AssemblyAI transcribes audio with speaker diarization
-✓ Gemini extracts key points, action items with owners, and meeting minutes
+✓ ElevenLabs Scribe v2 transcribes audio in a single API call
+✓ Burmese, English, and intra-sentence code-switching handled natively
+✓ Speaker diarization and word-level timestamps from Scribe v2 — no separate service
+✓ Zarla keyterms fed to Scribe for improved accuracy on product/company names
+✓ Non-English segments translated to English by Gemini before AI analysis
+✓ Translation failures degrade gracefully — null translatedText, job continues
+✓ Burmese script preserved exactly in original text field
+✓ Gemini extracts key points, action items, and meeting minutes from English transcript
 ✓ Employees can register and log in — JWT auth
 ✓ Person record auto-created on registration — seeds the registry
 ✓ All routes protected — unauthenticated requests return 401
 ✓ Meetings linked to the uploading employee
 ✓ Meeting list scoped per employee (admin sees all)
-✓ Worker transcription ends at "transcript_reviewing" — never skips human review
-✓ User reviews and confirms transcript in Step 1 (renames speakers via autocomplete)
-✓ AI analysis triggered after transcript confirmation — generates minutes/action items/key points
-✓ User reviews output in Step 2 (edit minutes, action items, add attendees)
-✓ Speaker labels renamed in Step 1 auto-populate the attendees list in Step 2
-✓ Attendees stored as structured list (not embedded in minutes markdown)
-✓ Minutes Prepared By and Date Prepared collected in Step 2 (defaults: current user + today)
-✓ Gemini prompt explicitly excludes attendees/prepared-by/date from generated minutes
+✓ Worker transcription ends at "transcript_reviewing" — never skips Step 1
+✓ Step 1 HITL: audio player synced to transcript, editable segments,
+  inline speaker rename via dropdown, language badges, translation editing
+✓ Transcript edits (text + translation) sent to backend and saved before analysis
+✓ AI analysis runs on confirmed English transcript — respects human corrections
+✓ Step 2 HITL: attendees, editable minutes, editable action items, prepared-by metadata
 ✓ Confirm creates MeetingParticipant rows + Person records per speaker
 ✓ Manual attendee entries auto-create Person records on confirm
-✓ Employee and person search endpoints for autocomplete in review UI
-✓ Confirm saves final output and sets status to "done"
-✓ Discard sets status to "discarded" — record kept, not hard-deleted
-✓ All confirmed outputs stored in own PostgreSQL database via Prisma
-✓ Meeting detail page is fully read-only — shows confirmed output only
-✓ Attendees, Minutes Prepared By, Date Prepared shown separately in Minutes tab
-✓ All four output tabs render correctly: Minutes, Action Items, Key Points, Transcript
-✓ Copy and markdown export work on confirmed meeting minutes
+✓ Meeting detail is fully read-only — all four tabs correct
+✓ Minutes tab shows attendees + prepared-by metadata separately from markdown
+✓ Transcript tab shows language badges + translations for non-English segments
+✓ Copy and export include attendees + metadata
 ✓ All screens have loading, error, and empty states
 □ Production deploy is live on Railway + Vercel
 □ End-to-end flow tested with a real meeting recording on production
@@ -1429,8 +1814,17 @@ design system.
 ✗ Build features outside the current build order step
 ✗ Skip loading, error, or empty states on any screen
 ✗ Add animations purely for decoration — every motion has meaning
-✗ Change the AI provider — Google Gemini gemini-2.5-flash only
+✗ Change the AI provider — Google Gemini gemini-2.5-flash-lite only
 ✗ Hard-delete any database row in Phase 1
+✗ Use AssemblyAI — replaced by ElevenLabs Scribe v2 entirely
+✗ Use Gemini File API for transcription — Scribe v2 handles all transcription
+✗ Skip deleteGeminiFile — no longer applicable, Scribe v2 has no file cleanup
+✗ Fail the whole job because of translation errors — log and continue with null translatedText
+✗ Add a language selector to the upload form — always-mixed, always Burmese primary
+✗ Set meeting status directly to "done" from the worker — always goes through HITL
+✗ Allow editing on the Meeting detail page — review is the only edit surface
+✗ Use browser default audio controls — always custom AudioPlayer.jsx
+✗ Change the STT provider from ElevenLabs Scribe v2 without updating this file
 ```
 
 ---
