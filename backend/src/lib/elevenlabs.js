@@ -59,6 +59,8 @@ function mapScribeResponse(response) {
 
   return segments.map((seg) => ({
     ...seg,
+    originalSpeaker: seg.speaker,
+    speakerOverride: false,
     originalLang: detectLang(seg.text),
     translatedText: null,
   }));
