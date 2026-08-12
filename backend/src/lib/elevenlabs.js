@@ -17,6 +17,9 @@ const ZARLA_KEYTERMS = [
   "Kafka",
   "Debezium",
   "ClickHouse",
+  "အစည်းအဝေး",
+  "စီမံကိန်း",
+  "အလုပ်",
 ];
 
 export async function transcribeAudio(audioBuffer, mimeType, speakersExpected) {
@@ -25,7 +28,6 @@ export async function transcribeAudio(audioBuffer, mimeType, speakersExpected) {
   const response = await client.speechToText.convert({
     file: blob,
     modelId: "scribe_v2",
-    languageCode: "mya",
     diarize: true,
     timestampsGranularity: "word",
     keyterms: ZARLA_KEYTERMS,
