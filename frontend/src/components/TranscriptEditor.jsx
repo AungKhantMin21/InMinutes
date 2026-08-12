@@ -172,13 +172,13 @@ function SegmentBlock({
           {showControls || globalDropdownOpen ? (
             <button
               onClick={() => { setGlobalDropdownOpen((o) => !o); setLocalDropdownOpen(false); }}
-              className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4 hover:text-ink-3 transition-colors duration-150 flex items-center gap-1"
+              className="font-mono text-[11px] tracking-[0.1em] uppercase text-ink-2 hover:text-ink border border-rule bg-ground px-1.5 py-0.5 flex items-center gap-1 transition-colors duration-150"
             >
               {displaySpeaker}
-              <span className="text-[8px]">▾</span>
+              <span className="text-[9px] opacity-60">▾</span>
             </button>
           ) : (
-            <span className="font-mono text-[9px] tracking-[0.14em] uppercase text-ink-4">
+            <span className="font-mono text-[11px] tracking-[0.1em] uppercase text-ink-3">
               {displaySpeaker}
             </span>
           )}
@@ -196,9 +196,9 @@ function SegmentBlock({
             <button
               onClick={() => { setLocalDropdownOpen((o) => !o); setGlobalDropdownOpen(false); }}
               title="Reassign this segment only"
-              className="font-mono text-[9px] text-ink-4 hover:text-ink-3 transition-colors duration-150"
+              className="font-mono text-[10px] text-ink-3 hover:text-ink border border-rule bg-ground px-1.5 py-0.5 transition-colors duration-150"
             >
-              ↻
+              ↻ segment
             </button>
             {localDropdownOpen && (
               <SpeakerDropdown
@@ -211,11 +211,11 @@ function SegmentBlock({
 
         {/* Reassigned indicator */}
         {segment.speakerOverride && (
-          <span className="font-mono text-[9px] text-ink-4 flex items-center gap-1">
-            · reassigned
+          <span className="font-mono text-[10px] text-ink-3 flex items-center gap-1.5 border border-rule bg-ground px-1.5 py-0.5">
+            ↻ reassigned
             <button
               onClick={onResetOverride}
-              className="text-ink-4 hover:text-danger transition-colors duration-150"
+              className="text-danger hover:opacity-70 transition-opacity duration-150 font-medium"
             >
               × reset
             </button>
