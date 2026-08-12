@@ -129,10 +129,11 @@ router.post("/:id/review/confirm-transcript", async (req, res) => {
       baseSegments = transcript.diarizedSegments;
     }
 
-    const mappedSegments = baseSegments.map((seg) => ({
-      ...seg,
-      speaker: (speakerMap && speakerMap[seg.speaker]) || seg.speaker,
-    }));
+    const mappedSegments = baseSegments.map((seg) => {
+      if (seg.speakerOverride) return seg;
+      const renamed = speakerMap?.[seg.originalSpeaker ?? seg.speaker];
+      return { ...seg, speaker: renamed ?? seg.speaker };
+    });
 
     await prisma.transcript.update({
       where: { meetingId: req.params.id },
