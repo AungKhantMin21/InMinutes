@@ -262,14 +262,16 @@ model Transcript {
   diarizedSegments Json
   // ElevenLabs Scribe v2 output — single-pass transcription + diarization:
   // [{
-  //   speaker: string,          // "speaker_0", "speaker_1" etc from Scribe
-  //   text: string,             // original text (Burmese, English, or mixed)
-  //   originalLang: string,     // "en" | "my" | "my-en" (detected via Unicode heuristic)
-  //   translatedText: string|null, // English translation — null if already English
-  //   start: number,            // milliseconds — word-level from Scribe
-  //   end: number               // milliseconds — word-level from Scribe
+  //   speaker: string,              // current display name — may be real name after HITL
+  //   originalSpeaker: string,      // original Scribe label ("speaker_0") — never changes
+  //   speakerOverride: boolean,     // true = manually reassigned for this segment only
+  //                                 // false = follows global speaker rename
+  //   text: string,                 // original text (Burmese, English, or mixed)
+  //   originalLang: string,         // "en" | "my" | "my-en"
+  //   translatedText: string|null,  // English translation — null if already English
+  //   start: number,                // milliseconds — from Scribe word-level timestamps
+  //   end: number                   // milliseconds — from Scribe word-level timestamps
   // }]
-  // speaker labels replaced with real names after Step 1 HITL confirm
   createdAt        DateTime @default(now())
 }
 
@@ -396,10 +398,13 @@ GET   /api/meetings/:id/audio-url        → { url, contentType }
 
 POST  /api/meetings/:id/review/confirm-transcript
                                          { speakerMap, diarizedSegments }
-                                         — diarizedSegments: edited segments from TranscriptEditor
-                                           (user may have corrected text or translations)
-                                         — applies speakerMap to segment speaker labels
-                                         — saves edited diarizedSegments back to Transcript table
+                                         — diarizedSegments: full edited segments including
+                                           speaker, originalSpeaker, speakerOverride,
+                                           text, originalLang, translatedText, start, end
+                                         — applies speakerMap as safety pass on non-overridden
+                                           segments (speakerOverride: false only)
+                                         — overridden segments (speakerOverride: true) untouched
+                                         — saves final diarizedSegments to Transcript table
                                          — queues BullMQ "analyze" job
                                          — status → "analyzing"
                                          → { status: "analyzing" }
@@ -435,7 +440,7 @@ The worker handles two BullMQ job types dispatched on `job.name`.
 
 ### Why ElevenLabs Scribe v2
 
-Previous approach used AssemblyAI for diarization and Gemini File
+Previous approach (Option B) used AssemblyAI for diarization and Gemini File
 API for transcription, merged by timestamp alignment. This was complex and
 fragile. Scribe v2 replaces both with a single API call:
 
@@ -754,9 +759,11 @@ function mapScribeResponse(response) {
   }
   if (current) segments.push(current);
 
-  // Add language detection + translatedText placeholder
+  // Add language detection + speakerOverride fields
   return segments.map((seg) => ({
     ...seg,
+    originalSpeaker: seg.speaker, // preserve original Scribe label — never mutated
+    speakerOverride: false, // false = follows global rename
     originalLang: detectLang(seg.text),
     translatedText: null, // filled by translation step in worker
   }));
@@ -882,9 +889,11 @@ TranscriptView in the review context.
 **On confirm-transcript:**
 
 - Full edited diarizedSegments array sent in POST body
-- Backend saves edited segments to Transcript table
-- AI analysis (analyze job) uses translatedText for English content
-  — user corrections to translations are respected
+  each segment includes speakerOverride flag and originalSpeaker
+- Backend applies speakerMap only to non-overridden segments (speakerOverride: false)
+- Overridden segments (speakerOverride: true) saved as-is — human correction respected
+- AI analysis (analyze job) uses each segment's final speaker name
+  and translatedText for English content — all corrections respected
 
 ### Upgrade 4 — Always-Mixed Multilingual Pipeline
 
@@ -1374,8 +1383,15 @@ the transcript in Step 1, which triggers AI analysis. Once analysis completes
 
     POST /api/meetings/:id/review/confirm-transcript
         — body: { speakerMap, diarizedSegments }
-        — applies speakerMap to segment speaker labels in provided diarizedSegments
-        — saves updated diarizedSegments to Transcript table
+        — diarizedSegments includes: speaker, originalSpeaker, speakerOverride,
+          text, originalLang, translatedText, start, end per segment
+        — safety pass on received segments:
+            for each segment where speakerOverride === false:
+              if speakerMap[segment.originalSpeaker] exists:
+                segment.speaker = speakerMap[segment.originalSpeaker]
+            for each segment where speakerOverride === true:
+              leave segment.speaker untouched — human correction respected
+        — saves final diarizedSegments to Transcript table
         — queues BullMQ job.name "analyze" → status "analyzing"
         — return { status: "analyzing" }
 
@@ -1435,21 +1451,78 @@ the transcript in Step 1, which triggers AI analysis. Once analysis completes
 □ TranscriptEditor.jsx
     — Props: segments, speakerMap, audioCurrentTime, onSegmentsChange,
              onSpeakerMapChange, onSeek (calls AudioPlayer.seekTo)
-    — Renders each segment as an editable block:
+    — Renders each segment as an editable block
+    — Manages two types of speaker editing: global rename and local override
 
-        Segment block layout:
+        ── Segment states ──────────────────────────────────────────────────
+
+        DEFAULT (not overridden, not hovered):
         ┌─────────────────────────────────────────────────────────┐
-        │ [Speaker Name ▼]  [my]  00:02:14                       │
+        │ AUNG NAING  [my]  00:02:14                             │
         │ ကောင်းပါပြီ၊ ဒီနှစ် budget က ဘယ်လောက်လဲ                │
         │ [EN] Okay, what is this year's budget?                  │
         └─────────────────────────────────────────────────────────┘
 
-        Speaker label: clickable, opens inline rename dropdown
-          — Dropdown: search input (debounced 300ms)
-          — Searches /api/people/employees then /api/people/persons
-          — "Use [typed name]" option at bottom
-          — Selecting a name updates ALL segments with that speaker label
-          — Updates speakerMap state in parent
+        HOVERED (show interactive affordances):
+        ┌─────────────────────────────────────────────────────────┐
+        │ [AUNG NAING ▼]  [↻]  [my]  00:02:14                   │
+        │ ကောင်းပါပြီ၊ ဒီနှစ် budget က ဘယ်လောက်လဲ                │
+        │ [EN] Okay, what is this year's budget?                  │
+        └─────────────────────────────────────────────────────────┘
+              ↑                ↑
+        global rename    local override
+        (all non-         (this segment
+        overridden         only)
+        segments)
+
+        LOCALLY OVERRIDDEN (speakerOverride: true):
+        ┌─────────────────────────────────────────────────────────┐
+        │ SET LET  [my]  00:02:14  · reassigned                  │
+        │ ကောင်းပါပြီ၊ ဒီနှစ် budget က ဘယ်လောက်လဲ                │
+        │ [EN] Okay, what is this year's budget?                  │
+        └─────────────────────────────────────────────────────────┘
+                                    ↑
+                            DM Mono, 9px, ink-4
+                            signals human correction
+
+        ── Global rename (click speaker label [▼]) ──────────────────────────
+
+        — Dropdown: search input (debounced 300ms)
+        — Searches /api/people/employees then /api/people/persons
+        — "Use [typed name]" option at bottom
+        — On select:
+            update speakerMap: { [originalSpeaker]: selectedName }
+            update ALL segments where:
+              segment.originalSpeaker === this originalSpeaker
+              AND segment.speakerOverride === false
+            overridden segments (speakerOverride: true) are SKIPPED
+            they have been manually corrected — global rename never touches them
+        — Updates speakerMap state in parent via onSpeakerMapChange
+
+        ── Local override (click reassign icon [↻]) ────────────────────────
+
+        — Only visible on hover
+        — Same search dropdown as global rename
+        — On select:
+            update THIS segment only:
+              segment.speaker = selectedName
+              segment.speakerOverride = true
+            speakerMap is NOT updated — this is a per-segment correction
+        — "· reassigned" indicator appears on the segment after override
+        — Calls onSegmentsChange with updated segments
+
+        ── Resetting an override ────────────────────────────────────────────
+
+        — On hover of an overridden segment: reassign icon [↻] still shown
+        — Also show a small "× reset" link next to "· reassigned"
+        — Clicking "× reset":
+            segment.speakerOverride = false
+            segment.speaker = speakerMap[segment.originalSpeaker] ?? segment.originalSpeaker
+            (reverts to whatever the global rename for this speaker label is)
+            "· reassigned" indicator disappears
+
+        ── Other segment fields ─────────────────────────────────────────────
+
         Language badge: shown only when originalLang !== "en"
           — DM Mono, 8px, ink-4, bg-ground, border-rule
         Timestamp: DM Mono, ink-4
@@ -1459,7 +1532,7 @@ the transcript in Step 1, which triggers AI analysis. Once analysis completes
           — Updates segment.text in local state
         Translation row: shown only when translatedText is not null
           — "[EN]" prefix (DM Mono, ink-4) + editable translation text
-          — Click to edit translation, click away to save
+          — Click to edit, click away to save
           — Updates segment.translatedText in local state
         Active segment highlight: when audioCurrentTime falls within
           segment.start/1000 and segment.end/1000:
@@ -1467,7 +1540,7 @@ the transcript in Step 1, which triggers AI analysis. Once analysis completes
           background: signal-light at 30% opacity
 
     — Calls onSegmentsChange on every edit (debounced 500ms)
-    — Calls onSpeakerMapChange when speaker label is renamed
+    — Calls onSpeakerMapChange when global rename applied
 
 □ StepTranscript (Step 1 of 2) — Transcript Review
     — Header: "STEP 1 OF 2 — Review Transcript"
@@ -1781,7 +1854,11 @@ Audio player usable on touch. TranscriptEditor segments readable at 768px.
 ✓ Worker transcription ends at "transcript_reviewing" — never skips Step 1
 ✓ Step 1 HITL: audio player synced to transcript, editable segments,
   inline speaker rename via dropdown, language badges, translation editing
-✓ Transcript edits (text + translation) sent to backend and saved before analysis
+✓ Global speaker rename: clicking label renames all non-overridden segments at once
+✓ Local speaker override: reassign icon [↻] on hover changes one segment only
+✓ Overridden segments show "· reassigned" indicator and can be reset
+✓ Global rename never touches locally overridden segments
+✓ Transcript edits (text + translation + speaker corrections) sent to backend
 ✓ AI analysis runs on confirmed English transcript — respects human corrections
 ✓ Step 2 HITL: attendees, editable minutes, editable action items, prepared-by metadata
 ✓ Confirm creates MeetingParticipant rows + Person records per speaker
